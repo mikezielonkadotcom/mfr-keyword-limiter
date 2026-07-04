@@ -6,6 +6,7 @@
  * Version: 1.0.0
  * Requires at least: 6.0
  * Requires PHP: 7.4
+ * Update URI: https://updates.mikezielonka.com/mfr-keyword-limiter/update.json
  * Author: Mike Zielonka Ventures
  * Author URI: https://mikezielonka.com
  * License: GPL-2.0-or-later
@@ -23,14 +24,49 @@ define( 'MFR_KEYWORD_LIMITER_PATH', plugin_dir_path( __FILE__ ) );
 require_once MFR_KEYWORD_LIMITER_PATH . 'includes/um-updater.php';
 
 if ( function_exists( 'UM\\PluginUpdater\\register' ) ) {
-	\UM\PluginUpdater\register(
+	$GLOBALS['mfr_keyword_limiter_updater'] = \UM\PluginUpdater\register(
 		array(
 			'file'       => MFR_KEYWORD_LIMITER_FILE,
 			'slug'       => 'mfr-keyword-limiter',
-			'update_url' => 'https://updates.mikezielonka.com/plugins/mfr-keyword-limiter/info.json',
+			'update_url' => 'https://updates.mikezielonka.com/mfr-keyword-limiter/update.json',
 			'server'     => 'https://updates.mikezielonka.com',
 		)
 	);
+}
+
+/**
+ * Register the updater privacy field on Settings > General.
+ */
+function mfr_keyword_limiter_register_updater_privacy_field(): void {
+	add_settings_section(
+		'mfr_keyword_limiter_update_privacy',
+		__( 'MFR Keyword Limiter Privacy', 'mfr-keyword-limiter' ),
+		'__return_false',
+		'general'
+	);
+
+	add_settings_field(
+		'mfr_keyword_limiter_um_telemetry_opt_out',
+		__( 'Update Telemetry', 'mfr-keyword-limiter' ),
+		'mfr_keyword_limiter_render_updater_privacy_field',
+		'general',
+		'mfr_keyword_limiter_update_privacy'
+	);
+}
+add_action( 'admin_init', 'mfr_keyword_limiter_register_updater_privacy_field' );
+
+/**
+ * Render the Update Machine telemetry opt-out field.
+ */
+function mfr_keyword_limiter_render_updater_privacy_field(): void {
+	$updater = $GLOBALS['mfr_keyword_limiter_updater'] ?? null;
+
+	if ( $updater && method_exists( $updater, 'telemetry_opt_out' ) ) {
+		$updater->telemetry_opt_out()->render_field();
+		return;
+	}
+
+	echo '<p class="description">' . esc_html__( 'Update telemetry controls are unavailable until the bundled updater finishes loading.', 'mfr-keyword-limiter' ) . '</p>';
 }
 
 add_filter( 'mfrh_ai_prompt', 'mfr_keyword_limiter_limit_keyword_in_prompt', 10, 3 );

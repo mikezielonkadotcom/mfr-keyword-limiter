@@ -22,6 +22,22 @@ The plugin filters Media File Renamer's `mfrh_ai_prompt` prompt for image alt/ti
 * Focus keywords are detected from Yoast SEO, Rank Math, and SEOPress.
 * Works during new uploads and bulk AI metadata updates.
 
+== Telemetry & privacy ==
+
+The updater sends a small telemetry payload to the update server:
+
+| Field | Sent on hourly update check | Sent on activation (registration) |
+|---|---|---|
+| `site_url` | Yes | Yes (also part of the HMAC signature) |
+| `site_name` | Yes | Yes |
+| `plugin_version` | Yes | Yes |
+| `plugin_slug` | No (implied by URL) | Yes |
+| `sdk_version` | Yes | Yes (also sent on challenge init) |
+
+That's the complete list. No admin email (removed in um-updater v4.1.0 because the site key already identifies the install), no WordPress version, no PHP version, no locale, and no user data. Zero-config challenge registration sends only `site_url`, `plugin_slug`, `plugin_version`, and `sdk_version`; it does not send the site name.
+
+Site owners can disable the telemetry payload from Settings > General. Update checks still happen, but the request body is empty; the update server sees only what any HTTP request carries, plus the auth headers needed to serve the manifest.
+
 == Installation ==
 
 1. Upload the `mfr-keyword-limiter` folder to `/wp-content/plugins/` or install the release zip through Plugins > Add New > Upload Plugin.
