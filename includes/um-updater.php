@@ -22,7 +22,7 @@
  *     $updater->set_license_client( $license_client );
  *
  * @package UM\PluginUpdater
- * @version 4.4.0
+ * @version 4.4.1
  */
 
 namespace UM\PluginUpdater;
@@ -35,7 +35,7 @@ defined( 'ABSPATH' ) || exit;
 // copy's classes win the class_exists race below — so the copy that DOES boot
 // can detect version skew and warn (see Updater::maybe_warn_version_skew).
 // Keep this literal in sync with @version.
-$GLOBALS['um_updater_sdk_copies']['4.4.0'][] = __FILE__;
+$GLOBALS['um_updater_sdk_copies']['4.4.1'][] = __FILE__;
 
 /**
  * Register a plugin for self-hosted updates.
@@ -81,7 +81,7 @@ class Updater {
 	private string $challenge_transient;
 
 	/** SDK version reported in telemetry — must match the file's @version. */
-	public const SDK_VERSION = '4.4.0';
+	public const SDK_VERSION = '4.4.1';
 
 	private const CHALLENGE_TTL = 15 * MINUTE_IN_SECONDS;
 
@@ -365,16 +365,39 @@ class Updater {
 			return;
 		}
 
+		$GLOBALS['um_updater_pending_challenges'][ (string) $challenge['id'] ] = [
+			'slug'  => $this->slug,
+			'token' => (string) $challenge['token'],
+		];
+
+		if ( ! empty( $GLOBALS['um_updater_challenge_route_registered'] ) ) {
+			return;
+		}
+
+		$GLOBALS['um_updater_challenge_route_registered'] = true;
+
 		register_rest_route( 'um-updater/v1', '/challenge/(?P<id>[0-9a-fA-F\-]{36})', [
 			'methods'             => 'GET',
 			'permission_callback' => '__return_true',
-			'callback'            => function ( $request ) use ( $challenge ) {
-				if ( ! hash_equals( $challenge['id'], (string) $request['id'] ) ) {
-					return new \WP_Error( 'um_unknown_challenge', __( 'Unknown challenge.', 'um-updater' ), [ 'status' => 404 ] );
-				}
-				return [ 'token' => $challenge['token'] ];
-			},
+			'callback'            => [ __CLASS__, 'serve_challenge_route' ],
 		] );
+	}
+
+	/**
+	 * Serve a challenge token from any plugin instance with a pending challenge.
+	 *
+	 * The route path stays global/back-compatible, so multiple bundled SDK
+	 * plugins on the same site cannot race to replace each other's callback.
+	 */
+	public static function serve_challenge_route( $request ) {
+		$id        = (string) $request['id'];
+		$challenge = $GLOBALS['um_updater_pending_challenges'][ $id ] ?? null;
+
+		if ( empty( $challenge['token'] ) ) {
+			return new \WP_Error( 'um_unknown_challenge', __( 'Unknown challenge.', 'um-updater' ), [ 'status' => 404 ] );
+		}
+
+		return [ 'token' => $challenge['token'] ];
 	}
 
 	/**
