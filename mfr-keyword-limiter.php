@@ -6,7 +6,7 @@
  * Version: 1.0.0
  * Requires at least: 6.0
  * Requires PHP: 7.4
- * Update URI: https://updates.mikezielonka.com/mfr-keyword-limiter/update.json
+ * Update URI: https://updatemachine.com/mfr-keyword-limiter/update.json
  * Author: Mike Zielonka Ventures
  * Author URI: https://mikezielonka.com
  * License: GPL-2.0-or-later
@@ -28,8 +28,8 @@ if ( function_exists( 'UM\\PluginUpdater\\register' ) ) {
 		array(
 			'file'       => MFR_KEYWORD_LIMITER_FILE,
 			'slug'       => 'mfr-keyword-limiter',
-			'update_url' => 'https://updates.mikezielonka.com/mfr-keyword-limiter/update.json',
-			'server'     => 'https://updates.mikezielonka.com',
+			'update_url' => 'https://updatemachine.com/mfr-keyword-limiter/update.json',
+			'server'     => 'https://updatemachine.com',
 		)
 	);
 }
