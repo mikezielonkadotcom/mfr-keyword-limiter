@@ -33,8 +33,14 @@ The updater sends a small telemetry payload to the update server:
 | `plugin_version` | Yes | Yes |
 | `plugin_slug` | No (implied by URL) | Yes |
 | `sdk_version` | Yes | Yes (also sent on challenge init) |
+| `php_version` | Yes | No |
+| `wp_version` | Yes | No |
+| `environment_type` | Yes | No |
+| `usage` | Optional, plugin-provided | No |
 
-That's the complete list. No admin email (removed in um-updater v4.1.0 because the site key already identifies the install), no WordPress version, no PHP version, no locale, and no user data. Zero-config challenge registration sends only `site_url`, `plugin_slug`, `plugin_version`, and `sdk_version`; it does not send the site name.
+That is the complete list. No admin email (removed in um-updater v4.1.0 because the site key already identifies the install), no locale, and no user data. `usage` is absent unless this plugin explicitly opts in with a flat usage snapshot. Zero-config challenge registration sends only `site_url`, `plugin_slug`, `plugin_version`, and `sdk_version`; it does not send the site name.
+
+Optional usage snapshots are for plugin feature flags/counters, not user data. The SDK keeps at most 20 keys, allows only short scalar values, caps the serialized object at 2KB, and drops invalid usage data instead of sending it.
 
 Site owners can disable the telemetry payload from Settings > General. Update checks still happen, but the request body is empty; the update server sees only what any HTTP request carries, plus the auth headers needed to serve the manifest.
 

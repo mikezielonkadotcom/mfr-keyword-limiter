@@ -22,7 +22,7 @@
  *     $updater->set_license_client( $license_client );
  *
  * @package UM\PluginUpdater
- * @version 4.4.1
+ * @version 4.4.2
  */
 
 namespace UM\PluginUpdater;
@@ -35,7 +35,7 @@ defined( 'ABSPATH' ) || exit;
 // copy's classes win the class_exists race below — so the copy that DOES boot
 // can detect version skew and warn (see Updater::maybe_warn_version_skew).
 // Keep this literal in sync with @version.
-$GLOBALS['um_updater_sdk_copies']['4.4.1'][] = __FILE__;
+$GLOBALS['um_updater_sdk_copies']['4.4.2'][] = __FILE__;
 
 /**
  * Register a plugin for self-hosted updates.
@@ -45,6 +45,7 @@ $GLOBALS['um_updater_sdk_copies']['4.4.1'][] = __FILE__;
  *     @type string $slug       Plugin directory slug (e.g. 'my-plugin').
  *     @type string $update_url Full URL to the update.json manifest.
  *     @type string $server     Base URL of the update server (e.g. 'https://updatemachine.com').
+ *     @type callable $usage_callback Optional callback returning flat usage data for telemetry.
  * }
  * @return Updater|null The updater instance, or null if already registered.
  */
@@ -79,11 +80,20 @@ class Updater {
 	private string $cache_key;
 	private string $key_option;
 	private string $challenge_transient;
+	private string $download_403_option;
+	private string $opportunistic_registration_option;
+	private $usage_callback = null;
 
 	/** SDK version reported in telemetry — must match the file's @version. */
-	public const SDK_VERSION = '4.4.1';
+	public const SDK_VERSION = '4.4.2';
 
-	private const CHALLENGE_TTL = 15 * MINUTE_IN_SECONDS;
+	private const CHALLENGE_TTL             = 15 * MINUTE_IN_SECONDS;
+	private const REGISTRATION_RETRY_DELAYS = [
+		1 => 5 * MINUTE_IN_SECONDS,
+		2 => 30 * MINUTE_IN_SECONDS,
+		3 => 2 * HOUR_IN_SECONDS,
+	];
+	private const MAX_REGISTRATION_RETRIES = 3;
 
 	/** @var Telemetry_Opt_Out Per-plugin telemetry opt-out (option storage + settings UI). */
 	private Telemetry_Opt_Out $opt_out;
@@ -92,7 +102,7 @@ class Updater {
 	private $license_client = null;
 
 	private const CACHE_TTL = HOUR_IN_SECONDS;
-	private const ERROR_TTL = HOUR_IN_SECONDS;
+	private const ERROR_TTL = 10 * MINUTE_IN_SECONDS;
 
 	public function __construct( array $config ) {
 		$this->file       = $config['file'];
@@ -103,6 +113,9 @@ class Updater {
 		$this->cache_key  = 'um_update_' . $this->slug;
 		$this->key_option = 'um_site_key_' . $this->slug;
 		$this->challenge_transient = 'um_challenge_' . $this->slug;
+		$this->download_403_option = 'um_download_403_' . $this->slug;
+		$this->opportunistic_registration_option = 'um_registration_last_attempt_' . $this->slug;
+		$this->usage_callback = $config['usage_callback'] ?? null;
 		$this->opt_out    = new Telemetry_Opt_Out( $this->slug );
 	}
 
@@ -130,9 +143,12 @@ class Updater {
 	public static function cleanup( string $slug ): void {
 		delete_option( 'um_site_key_' . $slug );
 		delete_option( 'um_telemetry_optout_' . $slug );
+		delete_option( 'um_download_403_' . $slug );
+		delete_option( 'um_registration_last_attempt_' . $slug );
 		delete_transient( 'um_update_' . $slug );
 		delete_transient( 'um_challenge_' . $slug );
-		wp_clear_scheduled_hook( 'um_updater_challenge_verify_' . $slug );
+		wp_unschedule_hook( 'um_updater_challenge_verify_' . $slug );
+		wp_unschedule_hook( 'um_updater_challenge_init_retry_' . $slug );
 	}
 
 	/**
@@ -157,15 +173,65 @@ class Updater {
 			return;
 		}
 
+		$pair      = self::version_skew_pair( self::SDK_VERSION, $newest );
+		$dismissed = (array) get_option( 'um_updater_dismissed_version_skew', [] );
+		if ( ! empty( $dismissed[ $pair ] ) ) {
+			return;
+		}
+
+		$dismiss_url = wp_nonce_url(
+			add_query_arg(
+				[
+					'um_dismiss_sdk_skew' => $pair,
+				],
+				admin_url( 'plugins.php' )
+			),
+			'um_dismiss_sdk_skew_' . $pair
+		);
+
 		printf(
-			'<div class="notice notice-warning"><p>%s</p></div>',
+			'<div class="notice notice-warning is-dismissible"><p>%s <a href="%s">%s</a></p></div>',
 			esc_html( sprintf(
 				/* translators: 1: newest bundled SDK version, 2: SDK version actually running. */
 				__( 'um-updater SDK version skew: a plugin bundles v%1$s, but v%2$s loaded first and is serving all plugins. Update the plugins bundling older copies.', 'um-updater' ),
 				$newest,
 				self::SDK_VERSION
-			) )
+			) ),
+			esc_url( $dismiss_url ),
+			esc_html__( 'Dismiss this warning for this version pair.', 'um-updater' )
 		);
+	}
+
+	/**
+	 * Persist dismissal for the current loaded/newest SDK version pair.
+	 */
+	public static function maybe_dismiss_version_skew(): void {
+		if ( ! current_user_can( 'update_plugins' ) ) {
+			return;
+		}
+
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		$pair = sanitize_text_field( wp_unslash( $_GET['um_dismiss_sdk_skew'] ?? '' ) );
+		if ( '' === $pair ) {
+			return;
+		}
+
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		$nonce = sanitize_text_field( wp_unslash( $_GET['_wpnonce'] ?? '' ) );
+		if ( ! wp_verify_nonce( $nonce, 'um_dismiss_sdk_skew_' . $pair ) ) {
+			return;
+		}
+
+		$dismissed          = (array) get_option( 'um_updater_dismissed_version_skew', [] );
+		$dismissed[ $pair ] = true;
+		update_option( 'um_updater_dismissed_version_skew', $dismissed, false );
+	}
+
+	/**
+	 * Stable option key fragment for a loaded/newest SDK version pair.
+	 */
+	private static function version_skew_pair( string $loaded, string $newest ): string {
+		return sanitize_key( $loaded . '__' . $newest );
 	}
 
 	/**
@@ -198,12 +264,14 @@ class Updater {
 		// event only fires after begin_challenge_registration schedules it.
 		add_action( 'rest_api_init', [ $this, 'register_challenge_route' ] );
 		add_action( 'um_updater_challenge_verify_' . $this->slug, [ $this, 'run_challenge_verify' ] );
+		add_action( 'um_updater_challenge_init_retry_' . $this->slug, [ $this, 'run_challenge_init_retry' ] );
 
 		// Version-skew watchdog, hooked once no matter how many plugins
 		// register an updater.
 		if ( empty( $GLOBALS['um_updater_skew_hooked'] ) ) {
 			$GLOBALS['um_updater_skew_hooked'] = true;
 			add_action( 'admin_notices', [ __CLASS__, 'maybe_warn_version_skew' ] );
+			add_action( 'admin_init', [ __CLASS__, 'maybe_dismiss_version_skew' ] );
 		}
 
 		// Auto-register on activation if there's no key yet — HMAC when a
@@ -248,6 +316,13 @@ class Updater {
 			return;
 		}
 
+		$this->attempt_registration();
+	}
+
+	/**
+	 * Attempt whichever registration mode is configured for this site.
+	 */
+	private function attempt_registration(): void {
 		$secret = $this->get_registration_secret();
 		if ( ! empty( $secret ) ) {
 			$this->register_with_secret( $secret );
@@ -314,7 +389,7 @@ class Updater {
 	 * and stage it for the verify fetch-back (see the server's
 	 * SPEC-ZERO-CONFIG-REGISTRATION.md).
 	 */
-	private function begin_challenge_registration(): void {
+	private function begin_challenge_registration( int $attempt = 0 ): void {
 		$plugin_data     = get_file_data( $this->file, [ 'Version' => 'Version' ] );
 		$current_version = $plugin_data['Version'] ?? '';
 
@@ -333,6 +408,7 @@ class Updater {
 		] );
 
 		if ( is_wp_error( $response ) || 201 !== wp_remote_retrieve_response_code( $response ) ) {
+			$this->schedule_challenge_init_retry( $attempt + 1, $response );
 			return;
 		}
 
@@ -342,13 +418,25 @@ class Updater {
 		}
 
 		set_transient( $this->challenge_transient, [
-			'id'      => (string) $body['challenge_id'],
-			'token'   => (string) $body['challenge_token'],
-			'retried' => false,
+			'id'             => (string) $body['challenge_id'],
+			'token'          => (string) $body['challenge_token'],
+			'retried'        => false,
+			'verify_attempt' => 0,
 		], self::CHALLENGE_TTL );
 
 		$delay = max( 5, (int) ( $body['verify_after'] ?? 30 ) );
 		wp_schedule_single_event( time() + $delay, 'um_updater_challenge_verify_' . $this->slug );
+	}
+
+	/**
+	 * Cron callback for delayed challenge-init retries.
+	 */
+	public function run_challenge_init_retry( int $attempt = 1 ): void {
+		if ( empty( $this->server ) || $this->get_site_key() || get_transient( $this->challenge_transient ) ) {
+			return;
+		}
+
+		$this->begin_challenge_registration( max( 1, $attempt ) );
 	}
 
 	/**
@@ -408,6 +496,7 @@ class Updater {
 	public function run_challenge_verify(): void {
 		$challenge = get_transient( $this->challenge_transient );
 		if ( empty( $challenge['id'] ) ) {
+			$this->attempt_registration();
 			return;
 		}
 
@@ -421,7 +510,7 @@ class Updater {
 		] );
 
 		if ( is_wp_error( $response ) ) {
-			$this->maybe_retry_challenge( $challenge );
+			$this->maybe_retry_challenge( $challenge, $response );
 			return;
 		}
 
@@ -439,21 +528,193 @@ class Updater {
 			return;
 		}
 
-		// token_mismatch / expired / anything else — give up quietly.
+		if ( 'expired' === ( $body['reason'] ?? '' ) ) {
+			delete_transient( $this->challenge_transient );
+			$this->attempt_registration();
+			return;
+		}
+
+		if ( $this->is_retryable_response( $response ) ) {
+			$this->maybe_retry_challenge( $challenge, $response );
+			return;
+		}
+
+		// token_mismatch / anything else non-retryable — give up quietly.
 		delete_transient( $this->challenge_transient );
 	}
 
 	/**
 	 * One retry at +10 minutes for transient reachability failures.
 	 */
-	private function maybe_retry_challenge( array $challenge ): void {
-		if ( ! empty( $challenge['retried'] ) ) {
+	private function maybe_retry_challenge( array $challenge, $response = null ): void {
+		if ( null === $response ) {
+			if ( ! empty( $challenge['retried'] ) ) {
+				delete_transient( $this->challenge_transient );
+				return;
+			}
+			$challenge['retried'] = true;
+			set_transient( $this->challenge_transient, $challenge, self::CHALLENGE_TTL );
+			wp_schedule_single_event( time() + 10 * MINUTE_IN_SECONDS, 'um_updater_challenge_verify_' . $this->slug );
+			return;
+		}
+
+		$attempt = (int) ( $challenge['verify_attempt'] ?? 0 ) + 1;
+		if ( $attempt > self::MAX_REGISTRATION_RETRIES || ! $this->is_retryable_response( $response ) ) {
 			delete_transient( $this->challenge_transient );
 			return;
 		}
-		$challenge['retried'] = true;
+
+		$challenge['verify_attempt'] = $attempt;
 		set_transient( $this->challenge_transient, $challenge, self::CHALLENGE_TTL );
-		wp_schedule_single_event( time() + 10 * MINUTE_IN_SECONDS, 'um_updater_challenge_verify_' . $this->slug );
+		wp_schedule_single_event( time() + $this->retry_delay( $attempt, $response ), 'um_updater_challenge_verify_' . $this->slug );
+	}
+
+	/**
+	 * Schedule a retry for transient challenge-init failures.
+	 */
+	private function schedule_challenge_init_retry( int $attempt, $response ): void {
+		if ( $attempt > self::MAX_REGISTRATION_RETRIES || ! $this->is_retryable_response( $response ) ) {
+			return;
+		}
+
+		wp_schedule_single_event( time() + $this->retry_delay( $attempt, $response ), 'um_updater_challenge_init_retry_' . $this->slug, [ $attempt ] );
+	}
+
+	/**
+	 * Whether a registration response should be retried.
+	 */
+	private function is_retryable_response( $response ): bool {
+		if ( is_wp_error( $response ) ) {
+			return true;
+		}
+
+		$code = wp_remote_retrieve_response_code( $response );
+		return 429 === $code || $code >= 500;
+	}
+
+	/**
+	 * Backoff delay, honoring Retry-After on 429s.
+	 */
+	private function retry_delay( int $attempt, $response ): int {
+		$default = self::REGISTRATION_RETRY_DELAYS[ $attempt ] ?? ( 2 * HOUR_IN_SECONDS );
+
+		if ( ! is_wp_error( $response ) && 429 === wp_remote_retrieve_response_code( $response ) ) {
+			$retry_after = $this->retry_after_seconds( $response );
+			if ( $retry_after > 0 ) {
+				return $retry_after;
+			}
+		}
+
+		return $default;
+	}
+
+	/**
+	 * Parse Retry-After as seconds or an HTTP date.
+	 */
+	private function retry_after_seconds( $response ): int {
+		if ( ! function_exists( 'wp_remote_retrieve_header' ) ) {
+			return 0;
+		}
+
+		$value = wp_remote_retrieve_header( $response, 'retry-after' );
+		if ( '' === $value || null === $value ) {
+			return 0;
+		}
+
+		if ( is_numeric( $value ) ) {
+			return min( max( 0, (int) $value ), 6 * HOUR_IN_SECONDS );
+		}
+
+		$timestamp = strtotime( (string) $value );
+		if ( false === $timestamp ) {
+			return 0;
+		}
+
+		return min( max( 0, $timestamp - time() ), 6 * HOUR_IN_SECONDS );
+	}
+
+	/**
+	 * Build optional plugin usage telemetry.
+	 *
+	 * @return array|null Sanitized usage object, or null when absent/invalid.
+	 */
+	private function collect_usage(): ?array {
+		try {
+			$usage = [];
+
+			if ( is_callable( $this->usage_callback ) ) {
+				$usage = call_user_func( $this->usage_callback, $this->slug );
+			}
+
+			/**
+			 * Filter optional usage telemetry for this plugin.
+			 *
+			 * Return a flat associative array with up to 20 scalar feature flags,
+			 * counters, or short string values. Invalid entries are dropped.
+			 *
+			 * @param mixed  $usage Raw usage data from the callback, or [].
+			 * @param string $slug  Plugin slug being checked.
+			 */
+			$usage = apply_filters( 'um_updater_usage_' . $this->slug, $usage, $this->slug );
+
+			return $this->sanitize_usage( $usage );
+		} catch ( \Throwable $e ) {
+			return null;
+		}
+	}
+
+	/**
+	 * Sanitize usage telemetry to the server contract.
+	 *
+	 * @param mixed $usage Raw callback/filter return.
+	 * @return array|null Sanitized usage object, or null when absent/invalid.
+	 */
+	private function sanitize_usage( $usage ): ?array {
+		if ( ! is_array( $usage ) || $this->is_list_array( $usage ) ) {
+			return null;
+		}
+
+		$sanitized = [];
+		foreach ( $usage as $key => $value ) {
+			$key = substr( preg_replace( '/[^a-z0-9_]/', '', strtolower( (string) $key ) ), 0, 32 );
+			if ( '' === $key ) {
+				continue;
+			}
+
+			if ( is_bool( $value ) ) {
+				$sanitized[ $key ] = $value;
+			} elseif ( is_int( $value ) || is_float( $value ) ) {
+				if ( ! is_finite( (float) $value ) ) {
+					continue;
+				}
+				$sanitized[ $key ] = max( -1000000000, min( 1000000000, $value ) );
+			} elseif ( is_string( $value ) ) {
+				$sanitized[ $key ] = substr( preg_replace( '/[^A-Za-z0-9._+~-]/', '', $value ), 0, 64 );
+			} else {
+				continue;
+			}
+
+			if ( count( $sanitized ) >= 20 ) {
+				break;
+			}
+		}
+
+		if ( empty( $sanitized ) || strlen( wp_json_encode( $sanitized ) ) > 2048 ) {
+			return null;
+		}
+
+		return $sanitized;
+	}
+
+	/**
+	 * PHP 7.4-compatible list-array check.
+	 */
+	private function is_list_array( array $value ): bool {
+		if ( [] === $value ) {
+			return false;
+		}
+
+		return array_keys( $value ) === range( 0, count( $value ) - 1 );
 	}
 
 	/**
@@ -464,12 +725,45 @@ class Updater {
 	}
 
 	/**
+	 * Opportunistically re-enter registration from update checks.
+	 */
+	private function maybe_attempt_opportunistic_registration(): void {
+		if ( empty( $this->server ) || $this->get_site_key() || get_transient( $this->challenge_transient ) ) {
+			return;
+		}
+
+		$last_attempt = (int) get_option( $this->opportunistic_registration_option, 0 );
+		if ( $last_attempt > 0 && ( time() - $last_attempt ) < DAY_IN_SECONDS ) {
+			return;
+		}
+
+		update_option( $this->opportunistic_registration_option, time(), false );
+		$this->attempt_registration();
+	}
+
+	/**
+	 * Append download auth query args.
+	 */
+	private function add_download_auth_args( string $download_url, string $site_key ): string {
+		if ( '' === $download_url || '' === $site_key ) {
+			return $download_url;
+		}
+
+		$download_url = add_query_arg( 'key', $site_key, $download_url );
+
+		// site_url is auth identity for domain-locked keys, not telemetry.
+		return add_query_arg( 'site_url', get_site_url(), $download_url );
+	}
+
+	/**
 	 * Check for updates and inject into the update transient.
 	 */
 	public function check_update( object $transient ): object {
 		if ( empty( $transient->checked ) ) {
 			return $transient;
 		}
+
+		$this->maybe_attempt_opportunistic_registration();
 
 		$remote = $this->fetch_update_data();
 
@@ -483,7 +777,7 @@ class Updater {
 		$download_url = $this->validate_download_url( $remote->download_url ?? '' );
 		$site_key     = $this->get_site_key();
 		if ( $download_url && $site_key ) {
-			$download_url = add_query_arg( 'key', $site_key, $download_url );
+			$download_url = $this->add_download_auth_args( $download_url, $site_key );
 		}
 
 		// License-gated: if license client is set and invalid, show update but block download.
@@ -554,7 +848,7 @@ class Updater {
 		$download_url = $this->validate_download_url( $remote->download_url ?? '' );
 		$site_key     = $this->get_site_key();
 		if ( $download_url && $site_key ) {
-			$download_url = add_query_arg( 'key', $site_key, $download_url );
+			$download_url = $this->add_download_auth_args( $download_url, $site_key );
 		}
 
 		return (object) [
@@ -653,8 +947,11 @@ class Updater {
 		// Download the ZIP to a temp file.
 		$tmp = download_url( $package );
 		if ( is_wp_error( $tmp ) ) {
+			$this->maybe_self_heal_domain_locked_key( $tmp );
 			return $tmp;
 		}
+
+		delete_option( $this->download_403_option );
 
 		// Compute and compare SHA-256.
 		$actual = hash_file( 'sha256', $tmp );
@@ -669,6 +966,47 @@ class Updater {
 		}
 
 		return $tmp;
+	}
+
+	/**
+	 * After repeated 403s, assume a cloned domain-locked key and re-register.
+	 */
+	private function maybe_self_heal_domain_locked_key( $error ): void {
+		if ( ! $this->is_forbidden_download_error( $error ) || ! $this->get_site_key() ) {
+			return;
+		}
+
+		$count = (int) get_option( $this->download_403_option, 0 ) + 1;
+		if ( $count < 3 ) {
+			update_option( $this->download_403_option, $count, false );
+			return;
+		}
+
+		delete_option( $this->download_403_option );
+		delete_option( $this->key_option );
+		delete_transient( $this->cache_key );
+		$this->attempt_registration();
+	}
+
+	/**
+	 * Detect 403 download failures from common WP_Error shapes.
+	 */
+	private function is_forbidden_download_error( $error ): bool {
+		if ( ! is_wp_error( $error ) ) {
+			return false;
+		}
+
+		if ( method_exists( $error, 'get_error_code' ) && false !== strpos( (string) $error->get_error_code(), '403' ) ) {
+			return true;
+		}
+
+		$data = method_exists( $error, 'get_error_data' ) ? $error->get_error_data() : null;
+		if ( is_array( $data ) ) {
+			$code = $data['response']['code'] ?? $data['code'] ?? $data['status'] ?? null;
+			return 403 === (int) $code;
+		}
+
+		return 403 === (int) $data;
 	}
 
 	/**
@@ -715,9 +1053,9 @@ class Updater {
 		/**
 		 * Filter whether to disable telemetry on update checks.
 		 *
-		 * When true, the update check sends an empty body — no site_url,
-		 * site_name, or plugin_version. Auth headers (site key / license)
-		 * still go out because they're needed to serve the manifest.
+		 * When true, the update check sends an empty telemetry body. Auth
+		 * identity still goes out when needed: site keys, license headers,
+		 * and site_url for domain-locked keyed downloads.
 		 *
 		 * @param bool   $disabled Default false.
 		 * @param string $slug     Plugin slug being checked.
@@ -727,15 +1065,27 @@ class Updater {
 		/**
 		 * Filter the telemetry payload sent with update checks.
 		 *
-		 * @param array  $telemetry Payload: site_url, site_name, plugin_version, sdk_version.
+		 * @param array  $telemetry Payload: site_url, site_name, plugin_version,
+		 *                          sdk_version, php_version, wp_version,
+		 *                          environment_type.
 		 * @param string $slug      Plugin slug being checked.
 		 */
 		$telemetry = apply_filters( 'um_updater_telemetry', [
-			'site_url'       => get_site_url(),
-			'site_name'      => get_bloginfo( 'name' ),
-			'plugin_version' => $current_version,
-			'sdk_version'    => self::SDK_VERSION,
+			'site_url'         => get_site_url(),
+			'site_name'        => get_bloginfo( 'name' ),
+			'plugin_version'   => $current_version,
+			'sdk_version'      => self::SDK_VERSION,
+			'php_version'      => PHP_VERSION,
+			'wp_version'       => get_bloginfo( 'version' ),
+			'environment_type' => function_exists( 'wp_get_environment_type' ) ? wp_get_environment_type() : '',
 		], $this->slug );
+
+		if ( ! $telemetry_disabled ) {
+			$usage = $this->collect_usage();
+			if ( null !== $usage ) {
+				$telemetry['usage'] = $usage;
+			}
+		}
 
 		// Build request headers, including auth key if available.
 		$request_headers = [
@@ -830,8 +1180,8 @@ class Updater {
  * Saving is self-contained: the field carries its own nonce, and maybe_save()
  * runs on admin_init, so it works inside Settings API forms (options.php),
  * custom panels, or anywhere else that POSTs to wp-admin. When opted out, the
- * hourly update check sends an empty body and registration omits the site
- * name — see the um_updater_disable_telemetry filter in Updater.
+ * hourly update check sends an empty telemetry body and registration omits
+ * the site name — see the um_updater_disable_telemetry filter in Updater.
  */
 if ( ! class_exists( __NAMESPACE__ . '\\Telemetry_Opt_Out' ) ) {
 class Telemetry_Opt_Out {
