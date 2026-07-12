@@ -1,0 +1,194 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  PLUGIN_SLUG: mfr-keyword-limiter
+  UM_HOST: https://updatemachine.com
+  UM_ORG_SLUG: mzv
+
+jobs:
+  release:
+    name: Build and release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      artifact: ${{ steps.metadata.outputs.artifact }}
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v6
+
+      - name: Validate source and tag
+        id: metadata
+        shell: bash
+        run: |
+          bash scripts/validate-release.sh
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          PLUGIN_VERSION="$(sed -n 's/^[[:space:]]*\* Version:[[:space:]]*//p' "${PLUGIN_SLUG}.php" | head -n 1 | xargs)"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
+            echo "::error::Release tags must use the vX.Y.Z format"
+            exit 1
+          fi
+          if [ "$VERSION" != "$PLUGIN_VERSION" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match plugin Version ${PLUGIN_VERSION}"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "artifact=${PLUGIN_SLUG}-${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release ZIP
+        shell: bash
+        run: bash scripts/build-release.sh
+        env:
+          PLUGIN_VERSION: ${{ steps.metadata.outputs.version }}
+
+      - name: Validate final ZIP
+        shell: bash
+        run: bash scripts/validate-release.sh --zip "release/${{ steps.metadata.outputs.artifact }}.zip"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.metadata.outputs.artifact }}
+          path: release/${{ steps.metadata.outputs.artifact }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: MFR Keyword Limiter v${{ steps.metadata.outputs.version }}
+          files: release/${{ steps.metadata.outputs.artifact }}.zip
+          generate_release_notes: true
+          make_latest: true
+
+  publish-update-machine:
+    name: Publish to Update Machine
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v6
+
+      - name: Download release ZIP
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.release.outputs.artifact }}
+          path: /tmp/release
+
+      - name: Validate final ZIP
+        shell: bash
+        run: bash scripts/validate-release.sh --zip "/tmp/release/${{ needs.release.outputs.artifact }}.zip"
+
+      - name: Read release metadata
+        id: plugin
+        shell: bash
+        run: |
+          MAIN_FILE="${PLUGIN_SLUG}.php"
+
+          header_value() {
+            sed -n "s/^[[:space:]]*\* $1:[[:space:]]*//p" "$MAIN_FILE" | head -n 1 | xargs
+          }
+
+          write_output() {
+            {
+              echo "$1<<EOF"
+              echo "$2"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          }
+
+          write_output name "$(header_value 'Plugin Name')"
+          write_output description "$(header_value 'Description')"
+          write_output requires "$(header_value 'Requires at least')"
+          write_output requires_php "$(header_value 'Requires PHP')"
+          write_output tested "$(sed -n 's/^Tested up to:[[:space:]]*//p' readme.txt | head -n 1 | xargs)"
+
+      - name: Publish plugin
+        shell: bash
+        env:
+          UM_ADMIN_TOKEN: ${{ secrets.UM_ADMIN_TOKEN }}
+          PLUGIN_NAME: ${{ steps.plugin.outputs.name }}
+          PLUGIN_DESCRIPTION: ${{ steps.plugin.outputs.description }}
+          PLUGIN_REQUIRES: ${{ steps.plugin.outputs.requires }}
+          PLUGIN_REQUIRES_PHP: ${{ steps.plugin.outputs.requires_php }}
+          PLUGIN_TESTED: ${{ steps.plugin.outputs.tested }}
+        run: |
+          [ -n "$UM_ADMIN_TOKEN" ] || { echo "::error::UM_ADMIN_TOKEN is not configured"; exit 1; }
+
+          VERSION="${{ needs.release.outputs.version }}"
+          ZIP="/tmp/release/${{ needs.release.outputs.artifact }}.zip"
+          ZIP_SHA256="$(sha256sum "$ZIP" | awk '{print $1}')"
+          CHANGELOG="See https://github.com/${GITHUB_REPOSITORY}/releases/tag/v${VERSION}"
+
+          HTTP_STATUS="$(curl --silent --show-error --output /tmp/um-response.json --write-out '%{http_code}' \
+            --request POST "${UM_HOST}/api/admin/plugins" \
+            --header "Authorization: Bearer ${UM_ADMIN_TOKEN}" \
+            --form "slug=${PLUGIN_SLUG}" \
+            --form "name=${PLUGIN_NAME}" \
+            --form "version=${VERSION}" \
+            --form "requires=${PLUGIN_REQUIRES}" \
+            --form "requires_php=${PLUGIN_REQUIRES_PHP}" \
+            --form "tested=${PLUGIN_TESTED}" \
+            --form "description=${PLUGIN_DESCRIPTION}" \
+            --form "changelog=${CHANGELOG}" \
+            --form "sha256=${ZIP_SHA256}" \
+            --form "file=@${ZIP};type=application/zip")"
+
+          cat /tmp/um-response.json
+          if [ "$HTTP_STATUS" != '200' ]; then
+            echo "::error::Update Machine upload failed with HTTP ${HTTP_STATUS}"
+            exit 1
+          fi
+
+      - name: Claim MZV route
+        shell: bash
+        env:
+          UM_ADMIN_TOKEN: ${{ secrets.UM_ADMIN_TOKEN }}
+        run: |
+          HTTP_STATUS="$(curl --silent --show-error --output /tmp/um-claim-response.json --write-out '%{http_code}' \
+            --request POST "${UM_HOST}/api/admin/orgs/${UM_ORG_SLUG}/routes/bulk-claim" \
+            --header "Authorization: Bearer ${UM_ADMIN_TOKEN}" \
+            --header 'Content-Type: application/json' \
+            --data "{\"slugs\":[\"${PLUGIN_SLUG}\"]}")"
+
+          cat /tmp/um-claim-response.json
+          if [ "$HTTP_STATUS" != '200' ]; then
+            echo "::error::Update Machine route claim failed with HTTP ${HTTP_STATUS}"
+            exit 1
+          fi
+
+      - name: Verify published manifest
+        shell: bash
+        run: |
+          export MANIFEST="$(curl --fail --silent --show-error "${UM_HOST}/${PLUGIN_SLUG}/update.json")"
+          php -r '
+            $manifest = json_decode(getenv("MANIFEST"), true, 512, JSON_THROW_ON_ERROR);
+            $expected = [
+              "slug" => getenv("PLUGIN_SLUG"),
+              "version" => getenv("VERSION"),
+              "requires_php" => getenv("PLUGIN_REQUIRES_PHP"),
+            ];
+            foreach ($expected as $key => $value) {
+              if (($manifest[$key] ?? null) !== $value) {
+                fwrite(STDERR, "Manifest {$key} mismatch.\n");
+                exit(1);
+              }
+            }
+            if (empty($manifest["sha256"])) {
+              fwrite(STDERR, "Manifest sha256 is missing.\n");
+              exit(1);
+            }
+          '
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          PLUGIN_REQUIRES_PHP: ${{ steps.plugin.outputs.requires_php }}
