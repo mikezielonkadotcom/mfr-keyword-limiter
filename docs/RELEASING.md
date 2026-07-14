@@ -6,6 +6,9 @@ plugin metadata to `https://updatemachine.com/api/admin/plugins`, claims the MZV
 route, and verifies the flat manifest at
 `https://updatemachine.com/mfr-keyword-limiter/update.json`.
 
+A manual `workflow_dispatch` builds and validates the same package without
+creating a GitHub Release or publishing to Update Machine.
+
 Before tagging:
 
 1. Update the plugin header version, `MFR_KEYWORD_LIMITER_VERSION`, the readme

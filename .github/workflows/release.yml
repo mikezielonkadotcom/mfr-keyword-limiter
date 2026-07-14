@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -30,15 +31,19 @@ jobs:
         run: |
           bash scripts/validate-release.sh
 
-          VERSION="${GITHUB_REF_NAME#v}"
           PLUGIN_VERSION="$(sed -n 's/^[[:space:]]*\* Version:[[:space:]]*//p' "${PLUGIN_SLUG}.php" | head -n 1 | xargs)"
-          if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
-            echo "::error::Release tags must use the vX.Y.Z format"
-            exit 1
-          fi
-          if [ "$VERSION" != "$PLUGIN_VERSION" ]; then
-            echo "::error::Tag ${GITHUB_REF_NAME} does not match plugin Version ${PLUGIN_VERSION}"
-            exit 1
+          VERSION="$PLUGIN_VERSION"
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
+              echo "::error::Release tags must use the vX.Y.Z format"
+              exit 1
+            fi
+            if [ "$VERSION" != "$PLUGIN_VERSION" ]; then
+              echo "::error::Tag ${GITHUB_REF_NAME} does not match plugin Version ${PLUGIN_VERSION}"
+              exit 1
+            fi
           fi
 
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
@@ -63,6 +68,7 @@ jobs:
           retention-days: 30
 
       - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
@@ -74,6 +80,7 @@ jobs:
   publish-update-machine:
     name: Publish to Update Machine
     needs: release
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout tag
@@ -170,7 +177,9 @@ jobs:
       - name: Verify published manifest
         shell: bash
         run: |
-          export MANIFEST="$(curl --fail --silent --show-error "${UM_HOST}/${PLUGIN_SLUG}/update.json")"
+          MANIFEST="$(curl --fail --silent --show-error "${UM_HOST}/${PLUGIN_SLUG}/update.json")"
+          export MANIFEST
+          # shellcheck disable=SC2016
           php -r '
             $manifest = json_decode(getenv("MANIFEST"), true, 512, JSON_THROW_ON_ERROR);
             $expected = [

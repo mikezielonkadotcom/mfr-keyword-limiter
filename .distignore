@@ -9,3 +9,4 @@ release
 scripts
 .distignore
 .DS_Store
+/uninstall 2.php

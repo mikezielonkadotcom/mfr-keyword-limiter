@@ -2,9 +2,9 @@
 Contributors: mikezielonka
 Tags: media file renamer, alt text, image seo, wordpress seo, accessibility
 Requires at least: 6.0
-Tested up to: 6.8
+Tested up to: 7.0
 Requires PHP: 7.4
-Stable tag: 1.0.0
+Stable tag: 1.0.1
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -65,6 +65,10 @@ Yoast SEO, Rank Math, and SEOPress.
 The post featured image, the WPRM recipe image, and the WPRM recipe featured image.
 
 == Changelog ==
+
+= 1.0.1 =
+* Updated the bundled Update Machine SDK to v4.4.2.
+* Added the canonical GitHub Release and Update Machine publishing workflow.
 
 = 1.0.0 =
 * Initial release.
