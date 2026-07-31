@@ -3,7 +3,7 @@
  * Plugin Name: MFR Keyword Limiter
  * Plugin URI: https://github.com/mikezielonkadotcom/mfr-keyword-limiter
  * Description: Smart focus keyword distribution for Media File Renamer AI alt/title prompts, keeping keywords on priority images while avoiding keyword stuffing.
- * Version: 1.0.2
+ * Version: 1.0.3
  * Requires at least: 6.0
  * Requires PHP: 7.4
  * Update URI: https://updatemachine.com/mfr-keyword-limiter/update.json
@@ -17,11 +17,12 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'MFR_KEYWORD_LIMITER_VERSION', '1.0.2' );
+define( 'MFR_KEYWORD_LIMITER_VERSION', '1.0.3' );
 define( 'MFR_KEYWORD_LIMITER_FILE', __FILE__ );
 define( 'MFR_KEYWORD_LIMITER_PATH', plugin_dir_path( __FILE__ ) );
 
 require_once MFR_KEYWORD_LIMITER_PATH . 'includes/um-updater.php';
+require_once MFR_KEYWORD_LIMITER_PATH . 'includes/class-mfr-feature-telemetry.php';
 
 if ( function_exists( 'UM\\PluginUpdater\\register' ) ) {
 	$GLOBALS['mfr_keyword_limiter_updater'] = \UM\PluginUpdater\register(
@@ -30,6 +31,9 @@ if ( function_exists( 'UM\\PluginUpdater\\register' ) ) {
 			'slug'       => 'mfr-keyword-limiter',
 			'update_url' => 'https://updatemachine.com/mfr-keyword-limiter/update.json',
 			'server'     => 'https://updatemachine.com',
+			'telemetry_consent_mode' => 'opt_in',
+			'telemetry_data_description' => __( 'When enabled, sends only integration availability and detected SEO provider plus standard update diagnostics. No keywords, prompts, media data, content, user data, or credentials.', 'mfr-keyword-limiter' ),
+			'feature_telemetry' => MFR_Feature_Telemetry::config(),
 		)
 	);
 }
@@ -61,8 +65,8 @@ add_action( 'admin_init', 'mfr_keyword_limiter_register_updater_privacy_field' )
 function mfr_keyword_limiter_render_updater_privacy_field(): void {
 	$updater = $GLOBALS['mfr_keyword_limiter_updater'] ?? null;
 
-	if ( $updater && method_exists( $updater, 'telemetry_opt_out' ) ) {
-		$updater->telemetry_opt_out()->render_field();
+	if ( $updater && method_exists( $updater, 'telemetry_preference' ) ) {
+		$updater->telemetry_preference()->render_control();
 		return;
 	}
 

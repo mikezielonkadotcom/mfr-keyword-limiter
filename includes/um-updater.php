@@ -22,7 +22,7 @@
  *     $updater->set_license_client( $license_client );
  *
  * @package UM\PluginUpdater
- * @version 4.6.1
+ * @version 4.7.1
  */
 
 namespace UM\PluginUpdater;
@@ -35,7 +35,41 @@ defined( 'ABSPATH' ) || exit;
 // copy's classes win the class_exists race below — so the copy that DOES boot
 // can detect version skew and warn (see Updater::maybe_warn_version_skew).
 // Keep this literal in sync with @version.
-$GLOBALS['um_updater_sdk_copies']['4.6.1'][] = __FILE__;
+$GLOBALS['um_updater_sdk_copies']['4.7.1'][] = __FILE__;
+
+/**
+ * Validate an SDK endpoint before any hooks or requests are registered.
+ *
+ * Plain HTTP is limited to an explicit local-development escape hatch. It can
+ * never be enabled for a public hostname.
+ */
+if ( ! function_exists( __NAMESPACE__ . '\\is_allowed_endpoint' ) ) {
+function is_allowed_endpoint( $url, bool $allow_insecure_localhost = false ): bool {
+	if ( ! is_string( $url ) || '' === $url ) {
+		return false;
+	}
+
+	$parts = parse_url( $url );
+	if ( ! is_array( $parts ) || empty( $parts['scheme'] ) || empty( $parts['host'] )
+		|| isset( $parts['user'] ) || isset( $parts['pass'] ) ) {
+		return false;
+	}
+
+	$scheme = strtolower( (string) $parts['scheme'] );
+	$host   = trim( strtolower( rtrim( (string) $parts['host'], '.' ) ), '[]' );
+	if ( 'https' === $scheme ) {
+		return true;
+	}
+	if ( 'http' !== $scheme || ! $allow_insecure_localhost ) {
+		return false;
+	}
+
+	return 'localhost' === $host
+		|| '127.0.0.1' === $host
+		|| '::1' === $host
+		|| ( strlen( $host ) > 6 && '.local' === substr( $host, -6 ) );
+}
+} // end function_exists guard
 
 /**
  * Register a plugin for self-hosted updates.
@@ -47,9 +81,11 @@ $GLOBALS['um_updater_sdk_copies']['4.6.1'][] = __FILE__;
  *     @type string $server     Base URL of the update server (e.g. 'https://updatemachine.com').
  *     @type callable $usage_callback Optional callback returning flat usage data for telemetry.
  *     @type array $feature_telemetry Optional versioned feature telemetry schema and callback.
+ *     @type array $activity_telemetry Optional reviewed activity fields merged into feature telemetry.
  *     @type string $telemetry_consent_mode Optional opt_out, opt_in, or disabled policy. Default opt_out.
  *     @type string $telemetry_privacy_url Optional public privacy-policy URL used by the settings control.
  *     @type string $telemetry_data_description Optional exact local disclosure shown beside the control.
+ *     @type bool $allow_insecure_localhost Optional HTTP escape hatch for loopback and .local development only.
  * }
  * @return Updater|null The updater instance, the existing instance for a duplicate slug, or null for an empty slug.
  */
@@ -60,6 +96,12 @@ function register( array $config ): ?Updater {
 	$slug = $config['slug'] ?? '';
 	if ( empty( $slug ) || isset( $registered[ $slug ] ) ) {
 		return $registered[ $slug ] ?? null;
+	}
+
+	$allow_insecure = true === ( $config['allow_insecure_localhost'] ?? false );
+	if ( ! is_allowed_endpoint( $config['update_url'] ?? '', $allow_insecure )
+		|| ! is_allowed_endpoint( $config['server'] ?? '', $allow_insecure ) ) {
+		return null;
 	}
 
 	$updater = new Updater( $config );
@@ -184,6 +226,404 @@ class Storage_Scope {
 } // end class_exists guard
 
 /**
+ * Records bounded local activity and exposes only fixed enum summaries.
+ */
+if ( ! class_exists( __NAMESPACE__ . '\\Activity_Telemetry' ) ) {
+class Activity_Telemetry {
+
+	private const STATE_VERSION = 1;
+	private const MAX_METRICS   = 2;
+	private const MAX_FIELDS    = 4;
+
+	private string $slug;
+	private string $option;
+	private Storage_Scope $scope;
+	private Telemetry_Preference $preference;
+	private array $fields = [];
+	private array $metrics = [];
+	private bool $valid = false;
+	private bool $loaded = false;
+	private bool $dirty = false;
+	private bool $flush_scheduled = false;
+	private bool $purged = false;
+	private array $state = [ 'version' => self::STATE_VERSION, 'metrics' => [] ];
+	private $clock;
+
+	public function __construct( string $slug, Storage_Scope $scope, Telemetry_Preference $preference, array $config, $clock = null ) {
+		$this->slug       = $slug;
+		$this->option     = 'um_activity_telemetry_' . $slug;
+		$this->scope      = $scope;
+		$this->preference = $preference;
+		$this->clock      = is_callable( $clock ) ? $clock : null;
+		$this->valid      = $this->configure( $config );
+	}
+
+	public function is_valid(): bool {
+		return $this->valid;
+	}
+
+	/**
+	 * Enum definitions merged into the existing typed feature schema.
+	 */
+	public function schema_fields(): array {
+		if ( ! $this->valid ) {
+			return [];
+		}
+
+		$definitions = [
+			'active_days' => [ 'type' => 'enum', 'values' => [ 'high', 'low', 'medium', 'none' ] ],
+			'recency'     => [ 'type' => 'enum', 'values' => [ 'month', 'never', 'older', 'today', 'week' ] ],
+			'health'      => [ 'type' => 'enum', 'values' => [ 'healthy', 'insufficient', 'mixed', 'no_attempts', 'poor' ] ],
+		];
+		$fields = [];
+		foreach ( $this->fields as $key => $field ) {
+			$fields[ $key ] = $definitions[ $field['summary'] ];
+		}
+		ksort( $fields, SORT_STRING );
+		return $fields;
+	}
+
+	/**
+	 * Mark the current UTC day active for a declared metric.
+	 */
+	public function record_activity( string $metric ): void {
+		try {
+			if ( ! $this->can_record( $metric ) ) {
+				return;
+			}
+			$this->load_state();
+			$now  = $this->now();
+			$day  = gmdate( 'Y-m-d', $now );
+			$entry = $this->state['metrics'][ $metric ] ?? [ 'days' => [], 'recent' => 'never', 'outcomes' => [] ];
+			if ( isset( $entry['days'][ $day ] ) && $day === ( $entry['recent'] ?? '' ) ) {
+				return;
+			}
+			$entry['days'][ $day ] = true;
+			$entry['recent']       = $day;
+			$this->state['metrics'][ $metric ] = $entry;
+			$this->mark_dirty();
+		} catch ( \Throwable $e ) {
+			return;
+		}
+	}
+
+	/**
+	 * Mark activity and retain only the first boolean outcome in a UTC hour.
+	 */
+	public function record_outcome( string $metric, bool $successful ): void {
+		try {
+			if ( ! $this->can_record( $metric ) ) {
+				return;
+			}
+			$this->load_state();
+			$now   = $this->now();
+			$day   = gmdate( 'Y-m-d', $now );
+			$hour  = 'h' . gmdate( 'H', $now );
+			$entry = $this->state['metrics'][ $metric ] ?? [ 'days' => [], 'recent' => 'never', 'outcomes' => [] ];
+			$changed = false;
+			if ( ! isset( $entry['days'][ $day ] ) || $day !== ( $entry['recent'] ?? '' ) ) {
+				$entry['days'][ $day ] = true;
+				$entry['recent']       = $day;
+				$changed               = true;
+			}
+			if ( ! empty( $this->metrics[ $metric ]['health'] ) && ! isset( $entry['outcomes'][ $day ][ $hour ] ) ) {
+				$entry['outcomes'][ $day ][ $hour ] = $successful;
+				$changed = true;
+			}
+			if ( $changed ) {
+				$this->state['metrics'][ $metric ] = $entry;
+				$this->mark_dirty();
+			}
+		} catch ( \Throwable $e ) {
+			return;
+		}
+	}
+
+	/**
+	 * Build the fixed enum values sent in the next feature snapshot.
+	 */
+	public function collect_values(): array {
+		try {
+			if ( ! $this->sharing_enabled() ) {
+				$this->purge();
+				return [];
+			}
+			$this->load_state();
+			$now    = $this->now();
+			$values = [];
+			foreach ( $this->fields as $key => $field ) {
+				$entry = $this->state['metrics'][ $field['metric'] ] ?? [ 'days' => [], 'recent' => 'never', 'outcomes' => [] ];
+				switch ( $field['summary'] ) {
+					case 'active_days':
+						$values[ $key ] = $this->active_days_bucket( $entry, $now );
+						break;
+					case 'recency':
+						$values[ $key ] = $this->recency_bucket( $entry, $now );
+						break;
+					case 'health':
+						$values[ $key ] = $this->health_bucket( $entry, $now );
+						break;
+				}
+			}
+			ksort( $values, SORT_STRING );
+			return $values;
+		} catch ( \Throwable $e ) {
+			return [];
+		}
+	}
+
+	/**
+	 * Persist at most once per request. Public only because WordPress invokes it.
+	 */
+	public function flush(): void {
+		if ( ! $this->dirty ) {
+			return;
+		}
+		try {
+			if ( ! $this->sharing_enabled() ) {
+				$this->purge();
+				return;
+			}
+			$this->scope->update_option( $this->option, $this->state );
+		} catch ( \Throwable $e ) {
+			// Telemetry persistence must never affect the host request.
+		}
+		$this->dirty           = false;
+		$this->flush_scheduled = false;
+	}
+
+	/**
+	 * Delete all locally retained activity immediately.
+	 */
+	public function purge(): void {
+		if ( $this->purged ) {
+			return;
+		}
+		try {
+			$missing = new \stdClass();
+			if ( $missing !== $this->scope->get_option( $this->option, $missing ) ) {
+				$this->scope->delete_option( $this->option );
+			}
+		} catch ( \Throwable $e ) {
+			// A storage failure must never affect preference changes or updates.
+		}
+		$this->state  = [ 'version' => self::STATE_VERSION, 'metrics' => [] ];
+		$this->loaded = true;
+		$this->dirty  = false;
+		$this->purged = true;
+	}
+
+	private function configure( array $config ): bool {
+		$fields = $config['fields'] ?? null;
+		if ( ! is_array( $fields ) || $this->is_list_array( $fields ) || empty( $fields ) || count( $fields ) > self::MAX_FIELDS ) {
+			return false;
+		}
+
+		$metrics = [];
+		foreach ( $fields as $key => $field ) {
+			if ( ! is_string( $key ) || ! preg_match( '/^[a-z][a-z0-9_]{0,31}$/', $key ) || ! is_array( $field ) ) {
+				return false;
+			}
+			$metric  = $field['metric'] ?? null;
+			$summary = $field['summary'] ?? null;
+			if ( ! is_string( $metric ) || ! preg_match( '/^[a-z][a-z0-9_]{0,31}$/', $metric )
+				|| ! in_array( $summary, [ 'active_days', 'recency', 'health' ], true ) ) {
+				return false;
+			}
+			$this->fields[ $key ] = [ 'metric' => $metric, 'summary' => $summary ];
+			$metrics[ $metric ][ $summary ] = true;
+		}
+		if ( count( $metrics ) > self::MAX_METRICS ) {
+			$this->fields = [];
+			return false;
+		}
+		$this->metrics = $metrics;
+		return true;
+	}
+
+	private function can_record( string $metric ): bool {
+		if ( ! $this->valid || ! isset( $this->metrics[ $metric ] ) ) {
+			return false;
+		}
+		if ( ! $this->sharing_enabled() ) {
+			$this->purge();
+			return false;
+		}
+		return true;
+	}
+
+	private function sharing_enabled(): bool {
+		if ( ! $this->preference->is_enabled() ) {
+			return false;
+		}
+		return ! (bool) apply_filters( 'um_updater_disable_telemetry', false, $this->slug );
+	}
+
+	private function load_state(): void {
+		if ( $this->loaded ) {
+			return;
+		}
+		$stored = $this->scope->get_option( $this->option, [] );
+		$this->state  = $this->normalize_state( is_array( $stored ) ? $stored : [] );
+		$this->loaded = true;
+	}
+
+	private function normalize_state( array $stored ): array {
+		$now       = $this->now();
+		$today     = $this->day_number( gmdate( 'Y-m-d', $now ) );
+		$normalized = [ 'version' => self::STATE_VERSION, 'metrics' => [] ];
+		$source     = isset( $stored['metrics'] ) && is_array( $stored['metrics'] ) ? $stored['metrics'] : [];
+
+		foreach ( $this->metrics as $metric => $summaries ) {
+			$entry = isset( $source[ $metric ] ) && is_array( $source[ $metric ] ) ? $source[ $metric ] : [];
+			$clean = [ 'days' => [], 'recent' => 'never', 'outcomes' => [] ];
+			foreach ( isset( $entry['days'] ) && is_array( $entry['days'] ) ? $entry['days'] : [] as $day => $active ) {
+				$age = $this->valid_day_age( $day, $today );
+				if ( null !== $age && $age <= 30 && true === $active ) {
+					$clean['days'][ $day ] = true;
+				}
+			}
+			$recent = $entry['recent'] ?? 'never';
+			if ( 'older' === $recent ) {
+				$clean['recent'] = 'older';
+			} else {
+				$age = $this->valid_day_age( $recent, $today );
+				if ( null !== $age ) {
+					$clean['recent'] = $age > 30 ? 'older' : $recent;
+				}
+			}
+			foreach ( isset( $entry['outcomes'] ) && is_array( $entry['outcomes'] ) ? $entry['outcomes'] : [] as $day => $hours ) {
+				$age = $this->valid_day_age( $day, $today );
+				if ( null === $age || $age > 30 || ! is_array( $hours ) ) {
+					continue;
+				}
+				foreach ( $hours as $hour => $successful ) {
+					if ( is_string( $hour ) && preg_match( '/^h(?:[01][0-9]|2[0-3])$/', $hour ) && is_bool( $successful ) ) {
+						$clean['outcomes'][ $day ][ $hour ] = $successful;
+					}
+				}
+			}
+			ksort( $clean['days'], SORT_STRING );
+			ksort( $clean['outcomes'], SORT_STRING );
+			$normalized['metrics'][ $metric ] = $clean;
+		}
+
+		if ( ! empty( $stored ) && $normalized !== $stored ) {
+			$this->state = $normalized;
+			$this->mark_dirty();
+		}
+		return $normalized;
+	}
+
+	private function mark_dirty(): void {
+		$this->dirty  = true;
+		$this->purged = false;
+		if ( ! $this->flush_scheduled ) {
+			$this->flush_scheduled = true;
+			add_action( 'shutdown', [ $this, 'flush' ], PHP_INT_MAX );
+		}
+	}
+
+	private function active_days_bucket( array $entry, int $now ): string {
+		$today = $this->day_number( gmdate( 'Y-m-d', $now ) );
+		$count = 0;
+		foreach ( $entry['days'] ?? [] as $day => $active ) {
+			$age = $this->valid_day_age( $day, $today );
+			if ( true === $active && null !== $age && $age <= 29 ) {
+				++$count;
+			}
+		}
+		if ( 0 === $count ) {
+			return 'none';
+		}
+		if ( $count <= 3 ) {
+			return 'low';
+		}
+		return $count <= 14 ? 'medium' : 'high';
+	}
+
+	private function recency_bucket( array $entry, int $now ): string {
+		$recent = $entry['recent'] ?? 'never';
+		if ( 'never' === $recent || 'older' === $recent ) {
+			return $recent;
+		}
+		$age = $this->valid_day_age( $recent, $this->day_number( gmdate( 'Y-m-d', $now ) ) );
+		if ( null === $age ) {
+			return 'never';
+		}
+		if ( 0 === $age ) {
+			return 'today';
+		}
+		if ( $age <= 7 ) {
+			return 'week';
+		}
+		return $age <= 30 ? 'month' : 'older';
+	}
+
+	private function health_bucket( array $entry, int $now ): string {
+		$today   = $this->day_number( gmdate( 'Y-m-d', $now ) );
+		$samples = 0;
+		$success = 0;
+		foreach ( $entry['outcomes'] ?? [] as $day => $hours ) {
+			$age = $this->valid_day_age( $day, $today );
+			if ( null === $age || $age > 29 || ! is_array( $hours ) ) {
+				continue;
+			}
+			foreach ( $hours as $outcome ) {
+				if ( is_bool( $outcome ) ) {
+					++$samples;
+					$success += $outcome ? 1 : 0;
+				}
+			}
+		}
+		if ( 0 === $samples ) {
+			return 'no_attempts';
+		}
+		if ( $samples < 5 ) {
+			return 'insufficient';
+		}
+		$ratio = $success / $samples;
+		if ( $ratio >= 0.95 ) {
+			return 'healthy';
+		}
+		return $ratio >= 0.5 ? 'mixed' : 'poor';
+	}
+
+	private function valid_day_age( $day, int $today ): ?int {
+		if ( ! is_string( $day ) || ! preg_match( '/^\\d{4}-\\d{2}-\\d{2}$/', $day ) ) {
+			return null;
+		}
+		$number = $this->day_number( $day );
+		if ( null === $number || $number > $today ) {
+			return null;
+		}
+		return $today - $number;
+	}
+
+	private function day_number( string $day ): ?int {
+		$date = \DateTimeImmutable::createFromFormat( '!Y-m-d', $day, new \DateTimeZone( 'UTC' ) );
+		$errors = \DateTimeImmutable::getLastErrors();
+		if ( false === $date || ( is_array( $errors ) && ( $errors['warning_count'] > 0 || $errors['error_count'] > 0 ) )
+			|| $date->format( 'Y-m-d' ) !== $day ) {
+			return null;
+		}
+		return (int) floor( $date->getTimestamp() / DAY_IN_SECONDS );
+	}
+
+	private function now(): int {
+		return null === $this->clock ? time() : (int) call_user_func( $this->clock );
+	}
+
+	private function is_list_array( array $value ): bool {
+		if ( [] === $value ) {
+			return false;
+		}
+		return array_keys( $value ) === range( 0, count( $value ) - 1 );
+	}
+}
+} // end class_exists guard
+
+/**
  * Validates a declarative feature schema and builds bounded snapshots.
  */
 if ( ! class_exists( __NAMESPACE__ . '\\Feature_Telemetry' ) ) {
@@ -202,10 +642,28 @@ class Feature_Telemetry {
 
 	private string $slug;
 	private array $config;
+	private ?Activity_Telemetry $activity;
 
-	public function __construct( string $slug, array $config ) {
+	public function __construct( string $slug, array $config, ?Activity_Telemetry $activity = null ) {
 		$this->slug   = $slug;
 		$this->config = $config;
+		$this->activity = $activity;
+	}
+
+	/**
+	 * Whether configured and generated fields form one valid reviewed schema.
+	 */
+	public function accepts_activity(): bool {
+		$schema = $this->sanitize_schema();
+		if ( null === $schema ) {
+			return false;
+		}
+		$activity_fields = null === $this->activity ? [] : $this->activity->schema_fields();
+		$fields          = array_merge( $schema['fields'], $activity_fields );
+		ksort( $fields, SORT_STRING );
+		return ! array_intersect_key( $schema['fields'], $activity_fields )
+			&& count( $fields ) <= self::MAX_FIELDS
+			&& strlen( wp_json_encode( [ 'fields' => $fields ] ) ) <= self::MAX_SCHEMA_BYTES;
 	}
 
 	/**
@@ -213,27 +671,50 @@ class Feature_Telemetry {
 	 */
 	public function collect(): ?array {
 		try {
-			$schema = $this->sanitize_schema();
-			if ( null === $schema ) {
+			$schema          = $this->sanitize_schema();
+			$activity_fields = null === $this->activity ? [] : $this->activity->schema_fields();
+			if ( null === $schema || array_intersect_key( $schema['fields'], $activity_fields ) ) {
+				return null;
+			}
+			$configured_fields = $schema['fields'];
+			$schema['fields']   = array_merge( $configured_fields, $activity_fields );
+			ksort( $schema['fields'], SORT_STRING );
+			if ( count( $schema['fields'] ) > self::MAX_FIELDS
+				|| strlen( wp_json_encode( [ 'fields' => $schema['fields'] ] ) ) > self::MAX_SCHEMA_BYTES ) {
 				return null;
 			}
 
-			$values   = [];
-			$callback = $this->config['callback'] ?? null;
-			if ( is_callable( $callback ) ) {
-				$values = call_user_func( $callback, $this->slug );
+			$values = [];
+			try {
+				$callback = $this->config['callback'] ?? null;
+				if ( is_callable( $callback ) ) {
+					$values = call_user_func( $callback, $this->slug );
+				}
+
+				/**
+				 * Filter raw configured-feature values before schema validation.
+				 *
+				 * Activity values are merged afterward so host code cannot forge
+				 * SDK-owned summaries.
+				 *
+				 * @param mixed  $values Raw callback values, or [].
+				 * @param string $slug   Plugin slug being checked.
+				 * @param array  $schema Sanitized combined declarative schema.
+				 */
+				$values = apply_filters( 'um_updater_features_' . $this->slug, $values, $this->slug, $schema );
+				$values = $this->sanitize_values( $values, $configured_fields, ! empty( $activity_fields ) );
+			} catch ( \Throwable $e ) {
+				$values = ! empty( $activity_fields ) ? [] : null;
+			}
+			if ( null === $values ) {
+				return null;
 			}
 
-			/**
-			 * Filter raw feature values before schema validation.
-			 *
-			 * @param mixed  $values Raw callback values, or [].
-			 * @param string $slug   Plugin slug being checked.
-			 * @param array  $schema Sanitized declarative schema.
-			 */
-			$values = apply_filters( 'um_updater_features_' . $this->slug, $values, $this->slug, $schema );
-			$values = $this->sanitize_values( $values, $schema['fields'] );
-			if ( null === $values ) {
+			$activity_values = null === $this->activity ? [] : $this->activity->collect_values();
+			$activity_values = $this->sanitize_values( $activity_values, $activity_fields, true ) ?? [];
+			$values          = array_merge( $values, $activity_values );
+			ksort( $values, SORT_STRING );
+			if ( empty( $values ) || strlen( wp_json_encode( $values ) ) > self::MAX_VALUES_BYTES ) {
 				return null;
 			}
 
@@ -264,7 +745,10 @@ class Feature_Telemetry {
 		if ( ! is_int( $version ) || $version < 1 || $version > self::MAX_SCHEMA_VERSION ) {
 			return null;
 		}
-		if ( ! is_array( $fields ) || $this->is_list_array( $fields ) || empty( $fields ) || count( $fields ) > self::MAX_FIELDS ) {
+		if ( ! is_array( $fields ) || $this->is_list_array( $fields ) || count( $fields ) > self::MAX_FIELDS ) {
+			return null;
+		}
+		if ( empty( $fields ) && ( null === $this->activity || empty( $this->activity->schema_fields() ) ) ) {
 			return null;
 		}
 
@@ -341,7 +825,7 @@ class Feature_Telemetry {
 	/**
 	 * Keep only values declared by the schema and matching the declared type.
 	 */
-	private function sanitize_values( $values, array $fields ): ?array {
+	private function sanitize_values( $values, array $fields, bool $allow_empty = false ): ?array {
 		if ( ! is_array( $values ) || $this->is_list_array( $values ) ) {
 			return null;
 		}
@@ -377,7 +861,7 @@ class Feature_Telemetry {
 			}
 		}
 
-		if ( empty( $sanitized ) || strlen( wp_json_encode( $sanitized ) ) > self::MAX_VALUES_BYTES ) {
+		if ( ( empty( $sanitized ) && ! $allow_empty ) || strlen( wp_json_encode( $sanitized ) ) > self::MAX_VALUES_BYTES ) {
 			return null;
 		}
 
@@ -424,9 +908,10 @@ class Updater {
 	private Storage_Scope $scope;
 	private $usage_callback = null;
 	private ?Feature_Telemetry $feature_telemetry = null;
+	private ?Activity_Telemetry $activity_telemetry = null;
 
 	/** SDK version reported in telemetry — must match the file's @version. */
-	public const SDK_VERSION = '4.6.1';
+	public const SDK_VERSION = '4.7.1';
 
 	private const CHALLENGE_TTL             = 15 * MINUTE_IN_SECONDS;
 	private const CHALLENGE_EXPIRED_WINDOW  = DAY_IN_SECONDS;
@@ -470,6 +955,7 @@ class Updater {
 				$this->hash_expected_option,
 				'um_telemetry_consent_' . $this->slug,
 				'um_telemetry_optout_' . $this->slug,
+				'um_activity_telemetry_' . $this->slug,
 				$this->challenge_expired_option,
 				$this->download_403_option,
 				$this->opportunistic_registration_option,
@@ -477,9 +963,6 @@ class Updater {
 			[ $this->cache_key, $this->challenge_transient ]
 		);
 		$this->usage_callback = $config['usage_callback'] ?? null;
-		if ( ! empty( $config['feature_telemetry'] ) && is_array( $config['feature_telemetry'] ) ) {
-			$this->feature_telemetry = new Feature_Telemetry( $this->slug, $config['feature_telemetry'] );
-		}
 		$this->opt_out    = new Telemetry_Opt_Out(
 			$this->slug,
 			$this->scope,
@@ -489,6 +972,26 @@ class Updater {
 				'data_description' => $config['telemetry_data_description'] ?? '',
 			]
 		);
+		$feature_config = ! empty( $config['feature_telemetry'] ) && is_array( $config['feature_telemetry'] )
+			? $config['feature_telemetry']
+			: null;
+		if ( null !== $feature_config && ! empty( $config['activity_telemetry'] ) && is_array( $config['activity_telemetry'] ) ) {
+			$activity = new Activity_Telemetry( $this->slug, $this->scope, $this->opt_out, $config['activity_telemetry'] );
+			if ( $activity->is_valid() ) {
+				$this->activity_telemetry = $activity;
+			}
+		}
+		if ( null !== $feature_config ) {
+			$features = new Feature_Telemetry( $this->slug, $feature_config, $this->activity_telemetry );
+			if ( null !== $this->activity_telemetry && ! $features->accepts_activity() ) {
+				$this->activity_telemetry = null;
+				$features = new Feature_Telemetry( $this->slug, $feature_config );
+			}
+			$this->feature_telemetry = $features;
+		}
+		if ( null !== $this->activity_telemetry ) {
+			$this->opt_out->set_disabled_callback( [ $this->activity_telemetry, 'purge' ] );
+		}
 	}
 
 	/**
@@ -513,6 +1016,13 @@ class Updater {
 	}
 
 	/**
+	 * Get the bounded activity helper declared by this plugin, if valid.
+	 */
+	public function activity_telemetry(): ?Activity_Telemetry {
+		return $this->activity_telemetry;
+	}
+
+	/**
 	 * Delete all options/transients this updater stores for a plugin.
 	 *
 	 * Call from the host plugin's uninstall.php:
@@ -525,6 +1035,7 @@ class Updater {
 			'um_hash_expected_' . $slug,
 			'um_telemetry_consent_' . $slug,
 			'um_telemetry_optout_' . $slug,
+			'um_activity_telemetry_' . $slug,
 			'um_challenge_expired_' . $slug,
 			'um_download_403_' . $slug,
 			'um_registration_last_attempt_' . $slug,
@@ -1859,6 +2370,7 @@ class Telemetry_Preference {
 	private string $privacy_url;
 	private string $data_description;
 	private Storage_Scope $scope;
+	private $disabled_callback = null;
 
 	public function __construct( string $slug, Storage_Scope $scope, array $config = [] ) {
 		$this->slug             = $slug;
@@ -1917,6 +2429,13 @@ class Telemetry_Preference {
 	}
 
 	/**
+	 * Register the scoped activity cleanup invoked when sharing is disabled.
+	 */
+	public function set_disabled_callback( callable $callback ): void {
+		$this->disabled_callback = $callback;
+	}
+
+	/**
 	 * Persist a positive sharing preference and mirror the legacy opt-out bit.
 	 */
 	public function set_enabled( bool $enabled ): void {
@@ -1924,6 +2443,13 @@ class Telemetry_Preference {
 		$this->scope->update_option( $this->option, $enabled ? 'enabled' : 'disabled' );
 		$this->scope->update_option( $this->legacy_option, $enabled ? 0 : 1 );
 		$this->scope->delete_transient( 'um_update_' . $this->slug );
+		if ( ! $enabled && is_callable( $this->disabled_callback ) ) {
+			try {
+				call_user_func( $this->disabled_callback );
+			} catch ( \Throwable $e ) {
+				// Telemetry cleanup must never block the preference change.
+			}
+		}
 	}
 
 	/**
