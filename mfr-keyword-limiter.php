@@ -3,7 +3,7 @@
  * Plugin Name: MFR Keyword Limiter
  * Plugin URI: https://github.com/mikezielonkadotcom/mfr-keyword-limiter
  * Description: Smart focus keyword distribution for Media File Renamer AI alt/title prompts, keeping keywords on priority images while avoiding keyword stuffing.
- * Version: 1.0.3
+ * Version: 1.0.4
  * Requires at least: 6.0
  * Requires PHP: 7.4
  * Update URI: https://updatemachine.com/mfr-keyword-limiter/update.json
@@ -17,7 +17,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'MFR_KEYWORD_LIMITER_VERSION', '1.0.3' );
+define( 'MFR_KEYWORD_LIMITER_VERSION', '1.0.4' );
 define( 'MFR_KEYWORD_LIMITER_FILE', __FILE__ );
 define( 'MFR_KEYWORD_LIMITER_PATH', plugin_dir_path( __FILE__ ) );
 

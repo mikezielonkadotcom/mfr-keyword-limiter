@@ -91,7 +91,7 @@ UPDATER_SHA256="$(sha256_file includes/um-updater.php)"
 [ "$UPDATER_SHA256" = "$EXPECTED_UPDATER_SHA256" ] || fail "includes/um-updater.php SHA-256 mismatch: ${UPDATER_SHA256}"
 
 if command -v php >/dev/null 2>&1; then
-	for file in "$MAIN_FILE" includes/um-updater.php uninstall.php; do
+	for file in "$MAIN_FILE" includes/class-mfr-feature-telemetry.php includes/um-updater.php uninstall.php; do
 		php -l "$file" >/dev/null || fail "PHP syntax check failed: ${file}"
 	done
 else
@@ -116,6 +116,7 @@ if [ -n "$ZIP_PATH" ]; then
 
 	for required_file in \
 		"${SLUG}/${MAIN_FILE}" \
+		"${SLUG}/includes/class-mfr-feature-telemetry.php" \
 		"${SLUG}/includes/um-updater.php" \
 		"${SLUG}/readme.txt" \
 		"${SLUG}/uninstall.php"; do
@@ -125,7 +126,7 @@ if [ -n "$ZIP_PATH" ]; then
 	while IFS= read -r entry; do
 		case "$entry" in
 			*/|"") ;;
-			"${SLUG}/${MAIN_FILE}"|"${SLUG}/readme.txt"|"${SLUG}/uninstall.php"|"${SLUG}/includes/um-updater.php") ;;
+			"${SLUG}/${MAIN_FILE}"|"${SLUG}/readme.txt"|"${SLUG}/uninstall.php"|"${SLUG}/includes/class-mfr-feature-telemetry.php"|"${SLUG}/includes/um-updater.php") ;;
 			*) fail "ZIP contains an unexpected runtime file: ${entry}" ;;
 		esac
 	done < "$ZIP_LIST"
@@ -137,7 +138,7 @@ if [ -n "$ZIP_PATH" ]; then
 		exit 1
 	fi
 
-	for source_file in "$MAIN_FILE" readme.txt uninstall.php includes/um-updater.php; do
+	for source_file in "$MAIN_FILE" readme.txt uninstall.php includes/class-mfr-feature-telemetry.php includes/um-updater.php; do
 		unzip -p "$ZIP_PATH" "${SLUG}/${source_file}" > "$ZIP_FILE"
 		cmp -s "$source_file" "$ZIP_FILE" || fail "Final ZIP copy does not match source: ${source_file}"
 	done
