@@ -4,7 +4,7 @@ Tags: media file renamer, alt text, image seo, wordpress seo, accessibility
 Requires at least: 6.0
 Tested up to: 7.0
 Requires PHP: 7.4
-Stable tag: 1.0.2
+Stable tag: 1.0.3
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -42,7 +42,7 @@ That is the complete list. No admin email (removed in um-updater v4.1.0 because 
 
 Optional usage snapshots are for plugin feature flags/counters, not user data. The SDK keeps at most 20 keys, allows only short scalar values, caps the serialized object at 2KB, and drops invalid usage data instead of sending it.
 
-Site owners can disable the telemetry payload from Settings > General. Update checks still happen, but the request body is empty; the update server sees only what any HTTP request carries, plus the auth headers needed to serve the manifest.
+Optional update and feature telemetry is off by default. If a site owner enables it in plugin settings, the plugin sends standard updater diagnostics plus the bounded feature data described beside the control. It never sends post content, user data, secrets, or free-form values. Updates keep working when sharing is off, and transport uses HTTPS.
 
 == Installation ==
 
@@ -66,8 +66,8 @@ The post featured image, the WPRM recipe image, and the WPRM recipe featured ima
 
 == Changelog ==
 
-= 1.0.2 =
-* Updated the bundled Update Machine SDK to v4.6.1 with safer registration recovery, bounded domain-lock self-healing, and final-plugin cleanup.
+= 1.0.3 =
+* Updated the bundled Update Machine SDK to v4.7.1 with safer registration recovery, bounded domain-lock self-healing, and final-plugin cleanup.
 
 = 1.0.1 =
 * Updated the bundled Update Machine SDK to v4.4.2.
