@@ -22,7 +22,7 @@
  *     $updater->set_license_client( $license_client );
  *
  * @package UM\PluginUpdater
- * @version 4.7.1
+ * @version 4.8.0
  */
 
 namespace UM\PluginUpdater;
@@ -35,7 +35,7 @@ defined( 'ABSPATH' ) || exit;
 // copy's classes win the class_exists race below — so the copy that DOES boot
 // can detect version skew and warn (see Updater::maybe_warn_version_skew).
 // Keep this literal in sync with @version.
-$GLOBALS['um_updater_sdk_copies']['4.7.1'][] = __FILE__;
+$GLOBALS['um_updater_sdk_copies']['4.8.0'][] = __FILE__;
 
 /**
  * Validate an SDK endpoint before any hooks or requests are registered.
@@ -86,6 +86,29 @@ function is_allowed_endpoint( $url, bool $allow_insecure_localhost = false ): bo
  *     @type string $telemetry_privacy_url Optional public privacy-policy URL used by the settings control.
  *     @type string $telemetry_data_description Optional exact local disclosure shown beside the control.
  *     @type bool $allow_insecure_localhost Optional HTTP escape hatch for loopback and .local development only.
+ *     @type array $parent {
+ *         Optional. Declares this plugin as an add-on of an installed parent plugin.
+ *         Add-on plugins MUST call register_addon() instead of register() — it is
+ *         the only entry point that keeps parent gating in mixed-SDK fleets where
+ *         an older bundled SDK copy can load first (see docs/addon-packages.md).
+ *         When present, updates are only offered/installed while the installed parent
+ *         satisfies the manifest's declared compatibility range.
+ *
+ *         @type string       $file      Required. Parent plugin basename, e.g. 'email-mic/email-mic.php'.
+ *                                       Explicit — never inferred from manifest slugs.
+ *         @type string       $slug      Required. Parent slug as published on Update Machine, e.g. 'email-mic'.
+ *                                       Must match the manifest's parent.slug.
+ *         @type int|callable $api_major Optional. The installed parent's runtime API major, either as a
+ *                                       literal integer or a callable returning ?int evaluated lazily at
+ *                                       gate time (recommended: read the parent's declared constant).
+ *     }
+ *     @type string $addon_auth Required for add-ons. Explicit authorization
+ *                             mode: `parent_license` dynamically uses the
+ *                             registered parent's site credential,
+ *                             `package_key` keeps slug-local registration for
+ *                             separately keyed packages, and `public` sends no
+ *                             update credential. The server remains the source
+ *                             of truth for license status and entitlements.
  * }
  * @return Updater|null The updater instance, the existing instance for a duplicate slug, or null for an empty slug.
  */
@@ -94,8 +117,17 @@ function register( array $config ): ?Updater {
 	static $registered = [];
 
 	$slug = $config['slug'] ?? '';
-	if ( empty( $slug ) || isset( $registered[ $slug ] ) ) {
-		return $registered[ $slug ] ?? null;
+	if ( empty( $slug ) ) {
+		return null;
+	}
+	if ( isset( $registered[ $slug ] ) ) {
+		$existing = $registered[ $slug ];
+		// An add-on registration must never inherit an ordinary updater that
+		// happened to claim the same slug first.
+		if ( array_key_exists( 'parent', $config ) && $existing instanceof Updater && ! $existing->is_addon_registration() ) {
+			return null;
+		}
+		return $existing;
 	}
 
 	$allow_insecure = true === ( $config['allow_insecure_localhost'] ?? false );
@@ -111,6 +143,277 @@ function register( array $config ): ?Updater {
 	return $updater;
 }
 } // end function_exists guard
+
+/**
+ * Register an add-on plugin for parent-gated self-hosted updates.
+ *
+ * Add-on plugins MUST use this entry point instead of register(). Every SDK
+ * copy that understands add-on gating (4.8.0+) defines this function even when
+ * an older bundled SDK copy from another plugin loaded first and won the
+ * register()/Updater symbol race. In that mixed old-first order the add-on is
+ * never handed to the older SDK — it would serve ungated updates — so add-on
+ * updates fail closed behind a request-scoped guard: any stale update offer is
+ * stripped, downloads and uploaded overwrites for this plugin are blocked, and
+ * an admin notice explains that the plugin bundling the outdated SDK copy must
+ * be updated first. Healthy installed code is never deactivated.
+ *
+ * @param array $config Same shape as register(); the 'parent' entry is
+ *                      required and validated by the add-on contract.
+ * @return Updater|null Updater when a 4.8.0+ SDK copy serves the registration
+ *                      (including the fail-closed duplicate/invalid-config
+ *                      semantics of register()), or null when add-on updates
+ *                      are disabled fail-closed for this request.
+ */
+if ( ! function_exists( __NAMESPACE__ . '\\register_addon' ) ) {
+function register_addon( array $config ): ?Updater {
+	static $guarded = [];
+
+	// register() treats a present-but-invalid 'parent' as a fail-closed
+	// add-on registration, so a missing block must not degrade to an
+	// ordinary ungated registration.
+	if ( ! array_key_exists( 'parent', $config ) || null === $config['parent'] ) {
+		$config['parent'] = false;
+	}
+
+	$winning_sdk = defined( __NAMESPACE__ . '\\Updater::SDK_VERSION' )
+		? (string) constant( __NAMESPACE__ . '\\Updater::SDK_VERSION' )
+		: '0.0.0';
+	if ( version_compare( $winning_sdk, '4.8.0', '>=' ) ) {
+		$updater = register( $config );
+		if ( null !== $updater ) {
+			return $updater;
+		}
+		// A duplicate ordinary slug or invalid endpoint must remain fail-closed.
+		$slug = isset( $config['slug'] ) && is_string( $config['slug'] ) ? $config['slug'] : '';
+		if ( '' === $slug || isset( $guarded[ $slug ] ) ) {
+			return null;
+		}
+		$guarded[ $slug ] = true;
+		$guard = new Addon_Update_Guard( $config, $winning_sdk );
+		$guard->init();
+		return null;
+	}
+
+	// An older SDK copy owns register()/Updater for this request. Fail closed:
+	// never register the add-on with it.
+	$slug = isset( $config['slug'] ) && is_string( $config['slug'] ) ? $config['slug'] : '';
+	if ( '' === $slug || isset( $guarded[ $slug ] ) ) {
+		return null;
+	}
+	$guarded[ $slug ] = true;
+
+	$guard = new Addon_Update_Guard( $config, $winning_sdk );
+	$guard->init();
+
+	return null;
+}
+} // end function_exists guard
+
+/**
+ * Request-scoped fail-closed guard used when an older SDK copy won the
+ * register()/Updater symbol race in a mixed-version fleet.
+ *
+ * This class name is new in 4.8.0, so the copy bundled with the add-on always
+ * owns it — the class_exists race that hands register() to an older copy can
+ * never hand add-on gating to code that does not implement it.
+ */
+if ( ! class_exists( __NAMESPACE__ . '\\Addon_Update_Guard' ) ) {
+class Addon_Update_Guard {
+
+	private string $slug;
+	private string $file;
+	private string $basename;
+	private string $winning_sdk;
+	private string $parent_basename = '';
+	private ?string $parent_min_version = null;
+	private ?string $parent_max_version_exclusive = null;
+	private bool $parent_config_valid = false;
+	private bool $pending_activation_rollback = false;
+	private bool $pending_rollback_network = false;
+
+	public function __construct( array $config, string $winning_sdk ) {
+		$this->slug        = isset( $config['slug'] ) && is_string( $config['slug'] ) ? $config['slug'] : '';
+		$file              = isset( $config['file'] ) && is_string( $config['file'] ) ? $config['file'] : '';
+		$this->file        = $file;
+		$this->basename    = '' !== $file && function_exists( 'plugin_basename' ) ? plugin_basename( $file ) : '';
+		$this->winning_sdk = $winning_sdk;
+
+		$parent = $config['parent'] ?? null;
+		if ( is_array( $parent ) ) {
+			$parent_file = $parent['file'] ?? null;
+			$parent_slug = $parent['slug'] ?? null;
+			if ( is_string( $parent_file ) && strlen( $parent_file ) <= 191
+				&& false === strpos( $parent_file, '..' )
+				&& preg_match( '#^(?:[A-Za-z0-9._\- ]+/)?[A-Za-z0-9._\- ]+\.php$#', $parent_file )
+				&& is_string( $parent_slug )
+				&& preg_match( '/^[a-z0-9][a-z0-9._\-]{0,190}$/', $parent_slug ) ) {
+				$min = $parent['min_version'] ?? null;
+				$max = $parent['max_version_exclusive'] ?? null;
+				$valid_range = ( null === $min || ( is_string( $min ) && preg_match( '/^[0-9][0-9A-Za-z.\-+]{0,63}$/', $min ) ) )
+					&& ( null === $max || ( is_string( $max ) && preg_match( '/^[0-9][0-9A-Za-z.\-+]{0,63}$/', $max ) ) )
+					&& ( null === $min || null === $max || version_compare( $min, $max, '<' ) );
+				if ( ! $valid_range ) {
+					return;
+				}
+				$this->parent_basename     = $parent_file;
+				$this->parent_min_version  = $min;
+				$this->parent_max_version_exclusive = $max;
+				$this->parent_config_valid = true;
+			}
+		}
+	}
+
+	public function init(): void {
+		add_filter( 'pre_set_site_transient_update_plugins', [ $this, 'strip_update_offer' ], PHP_INT_MAX );
+		add_filter( 'site_transient_update_plugins', [ $this, 'strip_update_offer' ], PHP_INT_MAX );
+		add_filter( 'upgrader_pre_download', [ $this, 'block_download' ], 0, 4 );
+		add_filter( 'upgrader_source_selection', [ $this, 'block_source_selection' ], 0, 4 );
+		add_action( 'admin_notices', [ $this, 'render_notice' ] );
+		add_action( 'network_admin_notices', [ $this, 'render_notice' ] );
+		if ( '' !== $this->file && function_exists( 'register_activation_hook' ) ) {
+			register_activation_hook( $this->file, [ $this, 'guard_activation' ] );
+		}
+	}
+
+	/**
+	 * Remove any stale/native update offer for the guarded add-on.
+	 */
+	public function strip_update_offer( $transient ) {
+		if ( is_object( $transient ) && '' !== $this->basename && isset( $transient->response[ $this->basename ] ) ) {
+			unset( $transient->response[ $this->basename ] );
+		}
+		return $transient;
+	}
+
+	/**
+	 * Block package downloads for the guarded add-on only.
+	 */
+	public function block_download( $reply, $package = '', $upgrader = null, $hook_extra = [] ) {
+		if ( '' === $this->basename || ! is_array( $hook_extra )
+			|| ( $hook_extra['plugin'] ?? '' ) !== $this->basename ) {
+			return $reply;
+		}
+
+		return new \WP_Error( 'um_addon_sdk_conflict', $this->conflict_message() );
+	}
+
+	/**
+	 * Block uploaded/manual installs that would overwrite the guarded add-on.
+	 */
+	public function block_source_selection( $source, $remote_source = '', $upgrader = null, $hook_extra = [] ) {
+		if ( '' === $this->basename || ! is_string( $source ) || '' === $source ) {
+			return $source;
+		}
+
+		$our_dir = dirname( $this->basename );
+		if ( '.' === $our_dir || basename( rtrim( $source, '/\\' ) ) !== $our_dir ) {
+			return $source;
+		}
+
+		return new \WP_Error( 'um_addon_sdk_conflict', $this->conflict_message() );
+	}
+
+	/**
+	 * Fail closed when an add-on is activated while an old SDK owns the symbols.
+	 *
+	 * Full manifest/API gating is unavailable in this mixed order, but the
+	 * explicit registration contract still lets this copy enforce the same
+	 * installed/active parent and declared version-range prerequisites.
+	 *
+	 * @param mixed $network_wide Whether WordPress is network-activating the add-on.
+	 */
+	public function guard_activation( $network_wide = false ): void {
+		$network_wide = true === $network_wide;
+		if ( $this->parent_is_ready( $network_wide ) ) {
+			return;
+		}
+
+		$this->pending_activation_rollback = true;
+		$this->pending_rollback_network    = $network_wide;
+		add_action( 'activated_plugin', [ $this, 'rollback_blocked_activation' ], 10, 2 );
+	}
+
+	/**
+	 * Roll back only the activation attempt that this guard rejected.
+	 */
+	public function rollback_blocked_activation( $plugin, $network_wide = false ): void {
+		unset( $network_wide );
+		if ( ! $this->pending_activation_rollback || $plugin !== $this->basename ) {
+			return;
+		}
+
+		$this->pending_activation_rollback = false;
+		if ( function_exists( 'deactivate_plugins' ) ) {
+			deactivate_plugins( $this->basename, true, $this->pending_rollback_network );
+		}
+	}
+
+	/**
+	 * Whether the explicitly registered parent is installed and active in the
+	 * activation context. Network activation requires network activation of the
+	 * parent; site activation accepts a network- or site-active parent.
+	 */
+	private function parent_is_ready( bool $network_wide ): bool {
+		if ( ! $this->parent_config_valid ) {
+			return false;
+		}
+
+		if ( defined( 'WP_PLUGIN_DIR' ) ) {
+			$plugin_dir = (string) WP_PLUGIN_DIR;
+		} elseif ( defined( 'WP_CONTENT_DIR' ) ) {
+			$plugin_dir = (string) WP_CONTENT_DIR . '/plugins';
+		} else {
+			return false;
+		}
+
+		$parent_path = rtrim( $plugin_dir, '/\\' ) . '/' . $this->parent_basename;
+		if ( ! is_file( $parent_path ) || ! is_readable( $parent_path ) ) {
+			return false;
+		}
+		if ( null !== $this->parent_min_version || null !== $this->parent_max_version_exclusive ) {
+			$headers = function_exists( 'get_file_data' ) ? get_file_data( $parent_path, [ 'Version' => 'Version' ] ) : [];
+			$version = isset( $headers['Version'] ) ? trim( (string) $headers['Version'] ) : '';
+			if ( '' === $version
+				|| ( null !== $this->parent_min_version && version_compare( $version, $this->parent_min_version, '<' ) )
+				|| ( null !== $this->parent_max_version_exclusive && version_compare( $version, $this->parent_max_version_exclusive, '>=' ) ) ) {
+				return false;
+			}
+		}
+
+		$network_active = function_exists( 'is_multisite' ) && is_multisite()
+			? (array) get_site_option( 'active_sitewide_plugins', [] )
+			: [];
+		if ( isset( $network_active[ $this->parent_basename ] ) ) {
+			return true;
+		}
+		if ( $network_wide ) {
+			return false;
+		}
+
+		return in_array( $this->parent_basename, (array) get_option( 'active_plugins', [] ), true );
+	}
+
+	public function render_notice(): void {
+		if ( ! function_exists( 'current_user_can' ) || ! current_user_can( 'update_plugins' ) ) {
+			return;
+		}
+
+		printf(
+			'<div class="notice notice-warning"><p>%s</p></div>',
+			esc_html( $this->conflict_message() )
+		);
+	}
+
+	private function conflict_message(): string {
+		return sprintf(
+			/* translators: 1: add-on plugin slug, 2: SDK version that loaded first. */
+			__( 'Update Machine: updates for the add-on "%1$s" are paused because an older um-updater SDK copy (v%2$s) bundled by another plugin loaded first and cannot enforce parent compatibility. Update the plugin bundling the older SDK copy to restore add-on updates.', 'um-updater' ),
+			'' !== $this->slug ? $this->slug : $this->basename,
+			$this->winning_sdk
+		);
+	}
+}
+} // end class_exists guard
 
 /**
  * Resolves storage and identity for site-active and network-active plugins.
@@ -910,8 +1213,23 @@ class Updater {
 	private ?Feature_Telemetry $feature_telemetry = null;
 	private ?Activity_Telemetry $activity_telemetry = null;
 
+	/** @var array|null Normalized add-on parent registration, or null for ordinary plugins. */
+	private ?array $parent_config = null;
+
+	/** @var bool True when a 'parent' registration was supplied but rejected — all updates fail closed. */
+	private bool $addon_registration_invalid = false;
+
+	/** @var string Explicit add-on authorization mode. */
+	private string $addon_auth_mode = '';
+
+	/** @var bool True while a blocked add-on activation is waiting to be rolled back. */
+	private bool $pending_activation_rollback = false;
+
+	/** @var bool Whether the pending activation rollback is network-wide. */
+	private bool $pending_rollback_network = false;
+
 	/** SDK version reported in telemetry — must match the file's @version. */
-	public const SDK_VERSION = '4.7.1';
+	public const SDK_VERSION = '4.8.0';
 
 	private const CHALLENGE_TTL             = 15 * MINUTE_IN_SECONDS;
 	private const CHALLENGE_EXPIRED_WINDOW  = DAY_IN_SECONDS;
@@ -963,6 +1281,18 @@ class Updater {
 			[ $this->cache_key, $this->challenge_transient ]
 		);
 		$this->usage_callback = $config['usage_callback'] ?? null;
+		if ( array_key_exists( 'parent', $config ) ) {
+			$this->parent_config = $this->normalize_parent_config( $config['parent'] );
+			$auth_mode = $config['addon_auth'] ?? null;
+			if ( is_string( $auth_mode ) && in_array( $auth_mode, [ 'parent_license', 'package_key', 'public' ], true ) ) {
+				$this->addon_auth_mode = $auth_mode;
+			}
+			if ( null === $this->parent_config || '' === $this->addon_auth_mode ) {
+				// Fail closed: a plugin that declared add-on semantics but got the
+				// contract wrong must never receive ungated updates.
+				$this->addon_registration_invalid = true;
+			}
+		}
 		$this->opt_out    = new Telemetry_Opt_Out(
 			$this->slug,
 			$this->scope,
@@ -1236,6 +1566,17 @@ class Updater {
 		add_filter( 'plugin_row_meta', [ $this, 'plugin_row_meta' ], 10, 2 );
 		add_filter( 'upgrader_pre_download', [ $this, 'verify_download' ], 10, 4 );
 
+		// Add-on plugins: explain a withheld update instead of failing silently,
+		// guard uploaded/manual installs that bypass the download hook, and
+		// explain a blocked activation attempt.
+		if ( null !== $this->parent_config || $this->addon_registration_invalid ) {
+			add_action( 'admin_notices', [ $this, 'maybe_notice_withheld_addon_update' ] );
+			add_action( 'network_admin_notices', [ $this, 'maybe_notice_withheld_addon_update' ] );
+			add_action( 'admin_notices', [ $this, 'maybe_notice_blocked_addon_activation' ] );
+			add_action( 'network_admin_notices', [ $this, 'maybe_notice_blocked_addon_activation' ] );
+			add_filter( 'upgrader_source_selection', [ $this, 'guard_source_selection' ], 10, 4 );
+		}
+
 		// Wire the stored sharing preference into the telemetry filter
 		// and handle settings-form saves on admin_init.
 		$this->opt_out->register_hooks();
@@ -1310,7 +1651,32 @@ class Updater {
 			);
 		}
 
+		// Add-on activation guard: activating an add-on whose registered parent
+		// is missing or inactive in the requested context is rolled back after
+		// WordPress records the activation. This only affects the activation
+		// attempt itself — already-active healthy installed code is never
+		// touched — and an admin notice explains what to fix.
+		if ( $this->is_addon_registration() ) {
+			$blocked = $this->addon_activation_error( $network_wide );
+			if ( null !== $blocked ) {
+				$this->pending_activation_rollback = true;
+				$this->pending_rollback_network    = $network_wide;
+				add_action( 'activated_plugin', [ $this, 'rollback_blocked_activation' ], 10, 2 );
+				$this->scope->set_transient( 'um_addon_activation_blocked_' . $this->slug, $blocked, 10 * MINUTE_IN_SECONDS );
+				// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+				error_log( "um-updater [{$this->slug}]: Add-on activation blocked — {$blocked}" );
+				return;
+			}
+		}
+
 		if ( empty( $this->server ) || ! $this->scope->can_run_network_task() ) {
+			return;
+		}
+
+		// Public add-ons need no credential. Parent-licensed add-ons borrow the
+		// parent's credential dynamically at request time and must never create a
+		// slug-local ordinary key that could shadow that license activation.
+		if ( $this->is_addon_registration() && 'package_key' !== $this->addon_auth_mode ) {
 			return;
 		}
 
@@ -1324,9 +1690,113 @@ class Updater {
 	}
 
 	/**
+	 * Why activating this add-on must be rolled back, or null when allowed.
+	 *
+	 * Network activation requires a network-active parent because the add-on's
+	 * code would run on every site; site activation accepts a network-active
+	 * or site-active parent.
+	 */
+	private function addon_activation_error( bool $network_wide ): ?string {
+		if ( $this->addon_registration_invalid ) {
+			return __( 'its add-on parent registration is invalid. Contact the plugin author.', 'um-updater' );
+		}
+
+		$parent_slug = $this->parent_config['slug'];
+		$parent_path = $this->parent_plugin_path();
+		if ( '' === $parent_path || ! is_file( $parent_path ) || ! is_readable( $parent_path ) ) {
+			/* translators: %s: parent plugin slug. */
+			return sprintf( __( 'it requires the "%s" plugin, which is not installed.', 'um-updater' ), $parent_slug );
+		}
+
+		// Enforce the same declared parent range at activation time as at update
+		// gate time. This prevents an add-on from being activated against a
+		// parent version that its manifest contract explicitly excludes.
+		$parent_headers = function_exists( 'get_file_data' )
+			? get_file_data( $parent_path, [ 'Version' => 'Version' ] )
+			: [];
+		$parent_version = isset( $parent_headers['Version'] ) ? trim( (string) $parent_headers['Version'] ) : '';
+		if ( '' === $parent_version ) {
+			return sprintf( __( 'it requires a readable version from the "%s" plugin before it can be activated.', 'um-updater' ), $parent_slug );
+		}
+		if ( null !== $this->parent_config['min_version']
+			&& version_compare( $parent_version, $this->parent_config['min_version'], '<' ) ) {
+			return sprintf( __( 'it requires "%1$s" %2$s or newer (installed: %3$s).', 'um-updater' ), $parent_slug, $this->parent_config['min_version'], $parent_version );
+		}
+		if ( null !== $this->parent_config['max_version_exclusive']
+			&& version_compare( $parent_version, $this->parent_config['max_version_exclusive'], '>=' ) ) {
+			return sprintf( __( 'it supports "%1$s" versions below %2$s (installed: %3$s).', 'um-updater' ), $parent_slug, $this->parent_config['max_version_exclusive'], $parent_version );
+		}
+
+		$parent_basename = $this->parent_config['file'];
+		$network_active  = function_exists( 'is_multisite' ) && is_multisite()
+			? (array) get_site_option( 'active_sitewide_plugins', [] )
+			: [];
+		if ( isset( $network_active[ $parent_basename ] ) ) {
+			return null;
+		}
+		if ( $network_wide ) {
+			/* translators: %s: parent plugin slug. */
+			return sprintf( __( 'its parent plugin "%s" must be network-activated before this add-on can be network-activated.', 'um-updater' ), $parent_slug );
+		}
+		if ( in_array( $parent_basename, (array) get_option( 'active_plugins', [] ), true ) ) {
+			return null;
+		}
+
+		/* translators: %s: parent plugin slug. */
+		return sprintf( __( 'its parent plugin "%s" must be activated first.', 'um-updater' ), $parent_slug );
+	}
+
+	/**
+	 * Deactivate a just-recorded blocked activation. Public only because
+	 * WordPress invokes it on 'activated_plugin' (which fires after core
+	 * writes the active-plugins option, so deactivating earlier is a no-op).
+	 */
+	public function rollback_blocked_activation( $plugin, $network_wide = false ): void {
+		unset( $network_wide );
+		if ( ! $this->pending_activation_rollback || $plugin !== $this->basename ) {
+			return;
+		}
+
+		$this->pending_activation_rollback = false;
+		if ( function_exists( 'deactivate_plugins' ) ) {
+			deactivate_plugins( $this->basename, true, $this->pending_rollback_network );
+		}
+	}
+
+	/**
+	 * Explain a rolled-back add-on activation to admins who can act on it.
+	 */
+	public function maybe_notice_blocked_addon_activation(): void {
+		if ( ! $this->is_addon_registration() || ! current_user_can( 'activate_plugins' ) ) {
+			return;
+		}
+
+		$key     = 'um_addon_activation_blocked_' . $this->slug;
+		$message = $this->scope->get_transient( $key );
+		if ( ! is_string( $message ) || '' === $message ) {
+			return;
+		}
+		$this->scope->delete_transient( $key );
+
+		printf(
+			'<div class="notice notice-error"><p>%s</p></div>',
+			esc_html( sprintf(
+				/* translators: 1: plugin slug, 2: reason the activation was rolled back. */
+				__( 'Update Machine: "%1$s" was not activated because %2$s', 'um-updater' ),
+				$this->slug,
+				$message
+			) )
+		);
+	}
+
+	/**
 	 * Attempt whichever registration mode is configured for this site.
 	 */
 	private function attempt_registration(): void {
+		if ( $this->is_addon_registration() && 'package_key' !== $this->addon_auth_mode ) {
+			return;
+		}
+
 		$secret = $this->get_registration_secret();
 		if ( ! empty( $secret ) ) {
 			$this->register_with_secret( $secret );
@@ -1396,6 +1866,10 @@ class Updater {
 	 * SPEC-ZERO-CONFIG-REGISTRATION.md).
 	 */
 	private function begin_challenge_registration( int $attempt = 0 ): void {
+		if ( $this->is_addon_registration() && 'package_key' !== $this->addon_auth_mode ) {
+			return;
+		}
+
 		$plugin_data     = get_file_data( $this->file, [ 'Version' => 'Version' ] );
 		$current_version = $plugin_data['Version'] ?? '';
 
@@ -1439,6 +1913,10 @@ class Updater {
 	 * Cron callback for delayed challenge-init retries.
 	 */
 	public function run_challenge_init_retry( int $attempt = 1 ): void {
+		if ( $this->is_addon_registration() && 'package_key' !== $this->addon_auth_mode ) {
+			return;
+		}
+
 		if ( ! $this->scope->can_run_network_task() || empty( $this->server ) || $this->get_site_key() || $this->scope->get_transient( $this->challenge_transient ) ) {
 			return;
 		}
@@ -1455,6 +1933,10 @@ class Updater {
 	 * token is worthless to anyone who can't also answer for this domain.
 	 */
 	public function register_challenge_route(): void {
+		if ( $this->is_addon_registration() && 'package_key' !== $this->addon_auth_mode ) {
+			return;
+		}
+
 		$challenge = $this->scope->get_transient( $this->challenge_transient );
 		if ( empty( $challenge['id'] ) || empty( $challenge['token'] ) ) {
 			return;
@@ -1501,6 +1983,11 @@ class Updater {
 	 * then gives up quietly — the site stays keyless, same as today.
 	 */
 	public function run_challenge_verify(): void {
+		if ( $this->is_addon_registration() && 'package_key' !== $this->addon_auth_mode ) {
+			$this->scope->delete_transient( $this->challenge_transient );
+			return;
+		}
+
 		if ( ! $this->scope->can_run_network_task() ) {
 			return;
 		}
@@ -1804,9 +2291,62 @@ class Updater {
 	}
 
 	/**
+	 * Resolve the request credential and its server-bound site identity.
+	 *
+	 * Parent-licensed add-ons read the exact registered parent's scoped option
+	 * on every request. The key is never copied into add-on storage, so parent
+	 * rotation is immediate and a stale/add-on-local auto-registration key can
+	 * never shadow license authorization. Package entitlement, license status,
+	 * domain binding, and revocation are still verified by Update Machine.
+	 *
+	 * @return array{site_key:string,site_url:string,site_name:string}
+	 */
+	private function request_identity(): array {
+		$identity = [
+			'site_key'  => '',
+			'site_url'  => $this->scope->site_url(),
+			'site_name' => $this->scope->site_name(),
+		];
+
+		if ( ! $this->is_addon_registration() ) {
+			$identity['site_key'] = $this->get_site_key();
+			return $identity;
+		}
+
+		if ( $this->addon_registration_invalid || null === $this->parent_config ) {
+			return $identity;
+		}
+
+		if ( 'package_key' === $this->addon_auth_mode ) {
+			$identity['site_key'] = $this->get_site_key();
+			return $identity;
+		}
+
+		if ( 'parent_license' !== $this->addon_auth_mode || ! $this->is_parent_active_in_context() ) {
+			return $identity;
+		}
+
+		$parent_path = $this->parent_plugin_path();
+		if ( '' === $parent_path || ! is_file( $parent_path ) || ! is_readable( $parent_path ) ) {
+			return $identity;
+		}
+
+		$parent_scope          = new Storage_Scope( $this->parent_config['file'] );
+		$identity['site_key']  = (string) $parent_scope->get_option( 'um_site_key_' . $this->parent_config['slug'], '' );
+		$identity['site_url']  = $parent_scope->site_url();
+		$identity['site_name'] = $parent_scope->site_name();
+
+		return $identity;
+	}
+
+	/**
 	 * Opportunistically re-enter registration from update checks.
 	 */
 	private function maybe_attempt_opportunistic_registration(): void {
+		if ( $this->is_addon_registration() && 'package_key' !== $this->addon_auth_mode ) {
+			return;
+		}
+
 		if ( ! $this->scope->can_run_network_task() || empty( $this->server ) || $this->get_site_key() || $this->scope->get_transient( $this->challenge_transient ) ) {
 			return;
 		}
@@ -1830,15 +2370,427 @@ class Updater {
 	/**
 	 * Append download auth query args.
 	 */
-	private function add_download_auth_args( string $download_url, string $site_key ): string {
+	private function add_download_auth_args( string $download_url, string $site_key, string $site_url = '' ): string {
 		if ( '' === $download_url || '' === $site_key ) {
 			return $download_url;
 		}
 
 		$download_url = add_query_arg( 'key', $site_key, $download_url );
 
-		// site_url is auth identity for domain-locked keys, not telemetry.
-		return add_query_arg( 'site_url', $this->scope->site_url(), $download_url );
+		// site_url is auth identity for domain-locked keys, not telemetry. A
+		// parent-licensed add-on must use the parent's scoped identity along with
+		// the parent's credential.
+		if ( '' === $site_url ) {
+			$site_url = $this->request_identity()['site_url'];
+		}
+		return add_query_arg( 'site_url', $site_url, $download_url );
+	}
+
+	/**
+	 * Normalize and validate the add-on 'parent' registration config.
+	 *
+	 * The parent's location comes exclusively from this explicit registration —
+	 * filesystem paths are never inferred from untrusted manifest slugs.
+	 *
+	 * @param mixed $raw Raw 'parent' config value.
+	 * @return array|null Normalized [ file, slug, api_major ] or null when invalid.
+	 */
+	private function normalize_parent_config( $raw ): ?array {
+		if ( ! is_array( $raw ) ) {
+			return null;
+		}
+
+		$file = $raw['file'] ?? null;
+		if ( ! is_string( $file ) || strlen( $file ) > 191 || false !== strpos( $file, '..' )
+			|| ! preg_match( '#^(?:[A-Za-z0-9._\- ]+/)?[A-Za-z0-9._\- ]+\.php$#', $file ) ) {
+			return null;
+		}
+
+		$slug = $raw['slug'] ?? null;
+		if ( ! is_string( $slug ) || ! preg_match( '/^[a-z0-9][a-z0-9._\-]{0,190}$/', $slug ) ) {
+			return null;
+		}
+
+		$api_major = $raw['api_major'] ?? null;
+		if ( null !== $api_major && ! is_int( $api_major ) && ! is_callable( $api_major ) ) {
+			return null;
+		}
+
+		$min_version = $raw['min_version'] ?? null;
+		$max_version = $raw['max_version_exclusive'] ?? null;
+		if ( null !== $min_version && ( ! is_string( $min_version ) || ! $this->is_valid_version_string( $min_version ) ) ) {
+			return null;
+		}
+		if ( null !== $max_version && ( ! is_string( $max_version ) || ! $this->is_valid_version_string( $max_version )
+			|| ( null !== $min_version && version_compare( $min_version, $max_version, '>=' ) ) ) ) {
+			return null;
+		}
+
+		return [
+			'file'                  => $file,
+			'slug'                  => $slug,
+			'api_major'             => $api_major,
+			'min_version'           => $min_version,
+			'max_version_exclusive' => $max_version,
+		];
+	}
+
+	/**
+	 * Whether this updater was registered with add-on semantics (valid or not).
+	 */
+	public function is_addon_registration(): bool {
+		return null !== $this->parent_config || $this->addon_registration_invalid;
+	}
+
+	/**
+	 * Bounded version-string check; version_compare() handles ordering.
+	 */
+	private function is_valid_version_string( string $version ): bool {
+		return 1 === preg_match( '/^[0-9][0-9A-Za-z.\-+]{0,63}$/', $version );
+	}
+
+	/**
+	 * Validate one manifest parent-constraint object.
+	 *
+	 * @param mixed $parent Decoded manifest value.
+	 * @return array|null Normalized constraints, or null when malformed.
+	 */
+	private function validate_manifest_parent_object( $parent ): ?array {
+		if ( ! is_object( $parent ) ) {
+			return null;
+		}
+
+		$slug = $parent->slug ?? null;
+		if ( ! is_string( $slug ) || ! preg_match( '/^[a-z0-9][a-z0-9._\-]{0,190}$/', $slug ) ) {
+			return null;
+		}
+
+		// Update Machine omits min_version when the range is unbounded below, so
+		// absent/null reads as "no lower bound". When present it must be a valid
+		// version string.
+		$min = property_exists( $parent, 'min_version' ) ? $parent->min_version : null;
+		if ( null !== $min && ( ! is_string( $min ) || ! $this->is_valid_version_string( $min ) ) ) {
+			return null;
+		}
+
+		// The exclusive maximum may be null (or absent) to declare no upper
+		// bound. Anything else must be a valid version string, strictly above
+		// the minimum when both bounds are declared.
+		$max = property_exists( $parent, 'max_version_exclusive' ) ? $parent->max_version_exclusive : null;
+		if ( null !== $max ) {
+			if ( ! is_string( $max ) || ! $this->is_valid_version_string( $max )
+				|| ( null !== $min && version_compare( $min, $max, '>=' ) ) ) {
+				return null;
+			}
+		}
+
+		// API major is an explicit integer when declared.
+		$api_major = property_exists( $parent, 'api_major' ) ? $parent->api_major : null;
+		if ( null !== $api_major && ! is_int( $api_major ) ) {
+			return null;
+		}
+
+		return [
+			'slug'                  => $slug,
+			'min_version'           => $min,
+			'max_version_exclusive' => $max,
+			'api_major'             => $api_major,
+		];
+	}
+
+	/**
+	 * Classify a manifest's package metadata.
+	 *
+	 * Canonical server shape (Update Machine v2): top-level
+	 * `package_type: "addon"` plus `parent: { slug, min_version,
+	 * max_version_exclusive, api_major }`. A transitional alternate shape,
+	 * `package: { slug, type: "addon", parent: {...} }`, is accepted through
+	 * the 4.8.x line only and must agree with the canonical shape when both
+	 * appear. Unknown explicit package types and malformed structures fail
+	 * closed; manifests without either declaration are ordinary core
+	 * manifests and behave exactly as before.
+	 *
+	 * @return array { 'type' => 'core'|'addon'|'invalid', 'parent' => ?array }
+	 */
+	private function extract_addon_manifest( object $manifest ): array {
+		$invalid = [ 'type' => 'invalid', 'parent' => null ];
+
+		$canonical = null;
+		if ( property_exists( $manifest, 'package_type' ) ) {
+			if ( 'addon' !== $manifest->package_type ) {
+				return $invalid;
+			}
+			// The manifest belongs to this installed add-on, not merely to a
+			// compatible parent. Without this binding, a cached response for one
+			// add-on could be used to gate and authorize another add-on package.
+			if ( ! property_exists( $manifest, 'slug' ) || ! is_string( $manifest->slug ) || $manifest->slug !== $this->slug ) {
+				return $invalid;
+			}
+			$canonical = $this->validate_manifest_parent_object(
+				property_exists( $manifest, 'parent' ) ? $manifest->parent : null
+			);
+			if ( null === $canonical ) {
+				return $invalid;
+			}
+		}
+
+		$alternate = null;
+		if ( property_exists( $manifest, 'package' ) && is_object( $manifest->package )
+			&& property_exists( $manifest->package, 'type' ) ) {
+			$package = $manifest->package;
+			if ( 'addon' !== $package->type ) {
+				return $invalid;
+			}
+			if ( ! property_exists( $package, 'slug' )
+				|| ! is_string( $package->slug ) || $package->slug !== $this->slug ) {
+				return $invalid;
+			}
+			$alternate = $this->validate_manifest_parent_object(
+				property_exists( $package, 'parent' ) ? $package->parent : null
+			);
+			if ( null === $alternate ) {
+				return $invalid;
+			}
+		}
+
+		if ( null !== $canonical && null !== $alternate && $canonical !== $alternate ) {
+			return $invalid;
+		}
+
+		$parent = null !== $canonical ? $canonical : $alternate;
+		if ( null === $parent ) {
+			return [ 'type' => 'core', 'parent' => null ];
+		}
+
+		return [ 'type' => 'addon', 'parent' => $parent ];
+	}
+
+	/**
+	 * Absolute path to the registered parent plugin's main file.
+	 */
+	private function parent_plugin_path(): string {
+		if ( null === $this->parent_config ) {
+			return '';
+		}
+		if ( defined( 'WP_PLUGIN_DIR' ) ) {
+			$dir = WP_PLUGIN_DIR;
+		} elseif ( defined( 'WP_CONTENT_DIR' ) ) {
+			$dir = WP_CONTENT_DIR . '/plugins';
+		} else {
+			return '';
+		}
+
+		return rtrim( (string) $dir, '/\\' ) . '/' . $this->parent_config['file'];
+	}
+
+	/**
+	 * Whether the parent is active in the context this add-on updates from.
+	 *
+	 * A network-active add-on updates code shared by every site, so its parent
+	 * must be network-active — activation on a single subsite is not enough.
+	 * A site-active add-on (or any single-site install) may rely on either a
+	 * network-active parent or the current site's own activation.
+	 */
+	private function is_parent_active_in_context(): bool {
+		$parent_basename = $this->parent_config['file'];
+
+		if ( function_exists( 'is_multisite' ) && is_multisite() ) {
+			$network_active = (array) get_site_option( 'active_sitewide_plugins', [] );
+			if ( isset( $network_active[ $parent_basename ] ) ) {
+				return true;
+			}
+			if ( $this->scope->is_network() ) {
+				return false;
+			}
+		}
+
+		return in_array( $parent_basename, (array) get_option( 'active_plugins', [] ), true );
+	}
+
+	/**
+	 * Resolve the installed parent's runtime API major from the registration.
+	 *
+	 * Callables run lazily (all plugins are loaded by gate time) and any
+	 * failure or non-integer result reads as "unknown", which fails closed
+	 * when the manifest declares a required API major.
+	 */
+	private function resolve_parent_api_major(): ?int {
+		$api = null !== $this->parent_config ? $this->parent_config['api_major'] : null;
+		if ( is_int( $api ) ) {
+			return $api;
+		}
+		if ( is_callable( $api ) ) {
+			try {
+				$value = call_user_func( $api );
+			} catch ( \Throwable $e ) {
+				return null;
+			}
+			return is_int( $value ) ? $value : null;
+		}
+
+		return null;
+	}
+
+	/**
+	 * Decide whether an update from this manifest may be offered/installed.
+	 *
+	 * Gating always uses the actual installed plugin state — never server
+	 * telemetry — because WordPress update orchestration is not atomic.
+	 * Healthy installed code is never deactivated; an incompatible update is
+	 * simply withheld with a reason.
+	 *
+	 * @return array|null Null when the update may proceed, otherwise
+	 *                    [ 'code' => string, 'message' => string ].
+	 */
+	private function evaluate_addon_gate( object $manifest ): ?array {
+		$meta = $this->extract_addon_manifest( $manifest );
+
+		if ( 'invalid' === $meta['type'] ) {
+			return [
+				'code'    => 'manifest_malformed',
+				'message' => __( 'its update metadata is malformed. Contact the plugin author.', 'um-updater' ),
+			];
+		}
+
+		if ( $this->addon_registration_invalid ) {
+			return [
+				'code'    => 'registration_invalid',
+				'message' => __( 'its add-on parent registration is invalid. Contact the plugin author.', 'um-updater' ),
+			];
+		}
+
+		if ( 'core' === $meta['type'] ) {
+			if ( null !== $this->parent_config ) {
+				return [
+					'code'    => 'manifest_malformed',
+					'message' => __( 'this add-on update did not declare its required parent plugin. Contact the plugin author.', 'um-updater' ),
+				];
+			}
+			return null; // Ordinary plugin, ordinary manifest — unchanged behavior.
+		}
+
+		if ( null === $this->parent_config ) {
+			return [
+				'code'    => 'registration_missing',
+				'message' => __( 'the update is published as an add-on but this plugin did not register a parent plugin. Contact the plugin author.', 'um-updater' ),
+			];
+		}
+
+		$required = $meta['parent'];
+		if ( $required['slug'] !== $this->parent_config['slug'] ) {
+			return [
+				'code'    => 'manifest_malformed',
+				'message' => __( 'the update declares a different parent plugin than this plugin registered. Contact the plugin author.', 'um-updater' ),
+			];
+		}
+
+		$parent_slug = $required['slug'];
+		$parent_path = $this->parent_plugin_path();
+		if ( '' === $parent_path || ! is_file( $parent_path ) || ! is_readable( $parent_path ) ) {
+			return [
+				'code'    => 'parent_missing',
+				/* translators: %s: parent plugin slug. */
+				'message' => sprintf( __( 'it requires the "%s" plugin, which is not installed.', 'um-updater' ), $parent_slug ),
+			];
+		}
+
+		$parent_data    = get_file_data( $parent_path, [ 'Version' => 'Version' ] );
+		$parent_version = trim( (string) ( $parent_data['Version'] ?? '' ) );
+		if ( '' === $parent_version ) {
+			return [
+				'code'    => 'parent_missing',
+				/* translators: %s: parent plugin slug. */
+				'message' => sprintf( __( 'the installed "%s" plugin version could not be determined.', 'um-updater' ), $parent_slug ),
+			];
+		}
+
+		if ( ! $this->is_parent_active_in_context() ) {
+			return [
+				'code'    => 'parent_inactive',
+				'message' => $this->scope->is_network()
+					/* translators: %s: parent plugin slug. */
+					? sprintf( __( 'its parent plugin "%s" must be network-activated before this network-active add-on can update.', 'um-updater' ), $parent_slug )
+					/* translators: %s: parent plugin slug. */
+					: sprintf( __( 'its parent plugin "%s" is installed but not active here.', 'um-updater' ), $parent_slug ),
+			];
+		}
+
+		if ( null !== $required['min_version']
+			&& version_compare( $parent_version, $required['min_version'], '<' ) ) {
+			return [
+				'code'    => 'parent_too_old',
+				/* translators: 1: parent plugin slug, 2: required minimum version, 3: installed version. */
+				'message' => sprintf( __( 'it requires "%1$s" %2$s or newer (installed: %3$s). Update "%1$s" first.', 'um-updater' ), $parent_slug, $required['min_version'], $parent_version ),
+			];
+		}
+
+		if ( null !== $required['max_version_exclusive']
+			&& version_compare( $parent_version, $required['max_version_exclusive'], '>=' ) ) {
+			return [
+				'code'    => 'parent_too_new',
+				/* translators: 1: parent plugin slug, 2: exclusive maximum version, 3: installed version. */
+				'message' => sprintf( __( 'it supports "%1$s" versions below %2$s (installed: %3$s).', 'um-updater' ), $parent_slug, $required['max_version_exclusive'], $parent_version ),
+			];
+		}
+
+		if ( null !== $required['api_major'] ) {
+			$installed_api = $this->resolve_parent_api_major();
+			if ( null === $installed_api ) {
+				return [
+					'code'    => 'parent_api_unknown',
+					/* translators: 1: parent plugin slug, 2: required API major. */
+					'message' => sprintf( __( 'it requires "%1$s" API v%2$d, but the installed "%1$s" does not report an API version. Update "%1$s" first.', 'um-updater' ), $parent_slug, $required['api_major'] ),
+				];
+			}
+			if ( $installed_api !== $required['api_major'] ) {
+				return [
+					'code'    => 'parent_api_mismatch',
+					/* translators: 1: parent plugin slug, 2: required API major, 3: installed API major. */
+					'message' => sprintf( __( 'it requires "%1$s" API v%2$d (installed: API v%3$d).', 'um-updater' ), $parent_slug, $required['api_major'], $installed_api ),
+				];
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * Explain a withheld add-on update to admins who can act on it.
+	 *
+	 * Reads only the cached manifest — never triggers an HTTP request — and
+	 * renders nothing when there is no newer version or the gate passes.
+	 */
+	public function maybe_notice_withheld_addon_update(): void {
+		if ( ! $this->is_addon_registration() || ! current_user_can( 'update_plugins' ) ) {
+			return;
+		}
+
+		$cached = $this->scope->get_transient( $this->cache_key );
+		if ( ! is_object( $cached ) || empty( $cached->version ) ) {
+			return;
+		}
+
+		$plugin_data     = get_file_data( $this->file, [ 'Version' => 'Version' ] );
+		$current_version = (string) ( $plugin_data['Version'] ?? '' );
+		if ( '' === $current_version || ! version_compare( (string) $cached->version, $current_version, '>' ) ) {
+			return;
+		}
+
+		$gate = $this->evaluate_addon_gate( $cached );
+		if ( null === $gate ) {
+			return;
+		}
+
+		printf(
+			'<div class="notice notice-warning"><p>%s</p></div>',
+			esc_html( sprintf(
+				/* translators: 1: plugin slug, 2: available version, 3: reason the update is withheld. */
+				__( 'Update Machine: %1$s %2$s is available but is not being offered because %3$s', 'um-updater' ),
+				$this->slug,
+				(string) $cached->version,
+				$gate['message']
+			) )
+		);
 	}
 
 	/**
@@ -1857,13 +2809,24 @@ class Updater {
 			return $transient;
 		}
 
+		// Add-on parent compatibility gate: never advertise an update the
+		// installed parent cannot support (see docs/addon-packages.md). The
+		// admin notice hooked in init() explains why the update is withheld.
+		if ( null !== $this->evaluate_addon_gate( $remote ) ) {
+			if ( isset( $transient->response[ $this->basename ] ) ) {
+				unset( $transient->response[ $this->basename ] );
+			}
+			return $transient;
+		}
+
 		$current_version = $transient->checked[ $this->basename ] ?? '0.0.0';
 
 		// Validate download URL origin, then append key if we have one.
 		$download_url = $this->validate_download_url( $remote->download_url ?? '' );
-		$site_key     = $this->get_site_key();
+		$identity     = $this->request_identity();
+		$site_key     = $identity['site_key'];
 		if ( $download_url && $site_key ) {
-			$download_url = $this->add_download_auth_args( $download_url, $site_key );
+			$download_url = $this->add_download_auth_args( $download_url, $site_key, $identity['site_url'] );
 		}
 
 		// License-gated: if license client is set and invalid, show update but block download.
@@ -1932,9 +2895,16 @@ class Updater {
 		}
 
 		$download_url = $this->validate_download_url( $remote->download_url ?? '' );
-		$site_key     = $this->get_site_key();
+		$identity     = $this->request_identity();
+		$site_key     = $identity['site_key'];
 		if ( $download_url && $site_key ) {
-			$download_url = $this->add_download_auth_args( $download_url, $site_key );
+			$download_url = $this->add_download_auth_args( $download_url, $site_key, $identity['site_url'] );
+		}
+
+		// Withhold the download link (but keep the details view) while the
+		// add-on parent compatibility gate fails.
+		if ( null !== $this->evaluate_addon_gate( $remote ) ) {
+			$download_url = '';
 		}
 
 		return (object) [
@@ -2005,6 +2975,96 @@ class Updater {
 	}
 
 	/**
+	 * Guard uploaded/manual installs that would overwrite this add-on.
+	 *
+	 * WordPress's uploaded-plugin overwrite flow never passes
+	 * $hook_extra['plugin'], so verify_download() cannot see it. This filter
+	 * inspects the extracted source directory instead: when the incoming
+	 * plugin would land in this add-on's directory, reject it unless it is the
+	 * native updater flow that already passed verify_download() (parent gate,
+	 * manifest/package binding, and ZIP SHA-256). The source-selection hook has
+	 * no trustworthy handle for the original uploaded ZIP, so comparing only an
+	 * extracted Version header would let an attacker replace the package bytes
+	 * while retaining the published version number. Unrelated plugins and
+	 * ordinary (non-add-on) registrations are never touched, and blocking an
+	 * install never modifies the code already on disk.
+	 *
+	 * @param string|\WP_Error $source        Extracted source directory.
+	 * @param string           $remote_source Remote package path.
+	 * @param object|null      $upgrader      Upgrader instance.
+	 * @param array|null       $hook_extra    Extra data; uploads omit 'plugin'.
+	 * @return string|\WP_Error
+	 */
+	public function guard_source_selection( $source, $remote_source = '', $upgrader = null, $hook_extra = null ) {
+		if ( ! $this->is_addon_registration() || ! is_string( $source ) || '' === $source ) {
+			return $source;
+		}
+
+		$our_dir = dirname( $this->basename );
+		if ( '.' === $our_dir || basename( rtrim( $source, '/\\' ) ) !== $our_dir ) {
+			return $source; // Unrelated install.
+		}
+
+		// The native update flow identifies the plugin and already ran
+		// verify_download() (gate, package binding, and hash) before any
+		// files were fetched — do not re-gate it here.
+		if ( is_array( $hook_extra ) && ( $hook_extra['plugin'] ?? '' ) === $this->basename ) {
+			return $source;
+		}
+
+		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+		error_log( "um-updater [{$this->slug}]: Manual add-on overwrite blocked because its ZIP cannot be bound to the verified manifest hash." );
+		return new \WP_Error(
+			'um_addon_manual_install_blocked',
+			__( 'Installation blocked: manually uploaded add-on packages cannot be verified. Install add-on updates through the WordPress updater instead.', 'um-updater' )
+		);
+	}
+
+	/**
+	 * Bind an add-on download to the cached manifest, or explain the refusal.
+	 *
+	 * The requested package must be exactly the manifest's origin-validated
+	 * download URL (plus this install's own auth args), and add-on packages
+	 * must always carry a valid SHA-256 — the hash pins the exact bytes the
+	 * parent-compatibility gate evaluated.
+	 */
+	private function addon_package_binding_error( object $cached, string $package ): ?\WP_Error {
+		$expected = $this->validate_download_url( (string) ( $cached->download_url ?? '' ) );
+		if ( '' === $expected ) {
+			return new \WP_Error(
+				'um_addon_package_unbound',
+				__( 'Update blocked: the add-on update manifest does not provide a valid download URL for this package.', 'um-updater' )
+			);
+		}
+
+		$allowed  = [ $expected ];
+		$identity = $this->request_identity();
+		$site_key = $identity['site_key'];
+		if ( '' !== $site_key ) {
+			$allowed[] = $this->add_download_auth_args( $expected, $site_key, $identity['site_url'] );
+		}
+		if ( ! in_array( $package, $allowed, true ) ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			error_log( "um-updater [{$this->slug}]: Requested add-on package does not match the manifest download URL — refusing update." );
+			return new \WP_Error(
+				'um_addon_package_mismatch',
+				__( 'Update blocked: the requested package does not match the add-on update manifest. Refresh available updates and try again.', 'um-updater' )
+			);
+		}
+
+		if ( ! isset( $cached->sha256 ) || '' === $this->normalize_sha256( $cached->sha256 ) ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			error_log( "um-updater [{$this->slug}]: Add-on manifest omits a valid sha256 — refusing update." );
+			return new \WP_Error(
+				'um_addon_sha256_required',
+				__( 'Update blocked: add-on packages require a SHA-256 integrity hash in the update manifest. Please contact the plugin author.', 'um-updater' )
+			);
+		}
+
+		return null;
+	}
+
+	/**
 	 * Intercept plugin download to verify SHA-256 integrity when the manifest provides it.
 	 *
 	 * @param bool|string|\WP_Error $reply    Default false (no pre-download).
@@ -2028,6 +3088,45 @@ class Updater {
 		if ( false === $cached ) {
 			$cached        = $this->fetch_update_data();
 			$hash_expected = (bool) $this->scope->get_option( $this->hash_expected_option, false );
+		}
+
+		// Add-on parent compatibility gate: manual upgrader flows and stale
+		// native update transients cannot bypass the check. Scoped to this
+		// plugin's package only — the basename match above already excluded
+		// every unrelated plugin update.
+		if ( $this->is_addon_registration() && ! is_object( $cached ) ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			error_log( "um-updater [{$this->slug}]: Update manifest unavailable while confirming add-on parent compatibility — refusing update." );
+			return new \WP_Error(
+				'um_addon_manifest_unavailable',
+				__( 'Update blocked: the update manifest could not be retrieved to confirm add-on compatibility. Please try again.', 'um-updater' )
+			);
+		}
+
+		if ( is_object( $cached ) ) {
+			$gate = $this->evaluate_addon_gate( $cached );
+			if ( null !== $gate ) {
+				// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+				error_log( "um-updater [{$this->slug}]: Add-on update blocked ({$gate['code']})." );
+				return new \WP_Error(
+					'um_addon_' . $gate['code'],
+					sprintf(
+						/* translators: %s: reason the update is blocked. */
+						__( 'Update blocked: %s', 'um-updater' ),
+						$gate['message']
+					)
+				);
+			}
+
+			// Add-on downloads are bound to the manifest that passed the gate:
+			// exact package URL and a mandatory SHA-256. A stale offer or a
+			// crafted same-host package URL cannot ride an earlier gate pass.
+			if ( $this->is_addon_registration() ) {
+				$binding_error = $this->addon_package_binding_error( $cached, $package );
+				if ( null !== $binding_error ) {
+					return $binding_error;
+				}
+			}
 		}
 
 		if ( ! is_object( $cached ) ) {
@@ -2138,6 +3237,12 @@ class Updater {
 	 * and re-register through the normal 24-hour recovery cooldown.
 	 */
 	private function maybe_self_heal_domain_locked_key( $error ): void {
+		// A parent-license failure must never delete/replace the parent's key;
+		// rotation and revocation belong to the parent license lifecycle.
+		if ( $this->is_addon_registration() && 'package_key' !== $this->addon_auth_mode ) {
+			return;
+		}
+
 		if ( ! $this->is_forbidden_download_error( $error ) || ! $this->get_site_key() ) {
 			return;
 		}
@@ -2237,9 +3342,10 @@ class Updater {
 		 */
 		$telemetry_disabled = (bool) apply_filters( 'um_updater_disable_telemetry', false, $this->slug );
 
+		$request_identity   = $this->request_identity();
 		$telemetry          = $this->filter_base_telemetry( [
-			'site_url'         => $this->scope->site_url(),
-			'site_name'        => $this->scope->site_name(),
+			'site_url'         => $request_identity['site_url'],
+			'site_name'        => $request_identity['site_name'],
 			'plugin_version'   => $current_version,
 			'sdk_version'      => self::SDK_VERSION,
 			'php_version'      => PHP_VERSION,
@@ -2269,9 +3375,10 @@ class Updater {
 			'Content-Type' => 'application/json',
 		];
 
-		$site_key = $this->get_site_key();
+		$site_key = $request_identity['site_key'];
 		if ( $site_key ) {
 			$request_headers['X-Update-Key'] = $site_key;
+			$request_headers['X-Site-URL']   = $request_identity['site_url'];
 		}
 
 		// Include license credentials when a license client is wired up.
@@ -2279,19 +3386,20 @@ class Updater {
 			$license_key = $this->license_client->decrypt_key();
 			if ( '' !== $license_key ) {
 				$request_headers['X-License-Key'] = $license_key;
-				$request_headers['X-Site-URL']    = $this->scope->site_url();
+				$request_headers['X-Site-URL']    = $request_identity['site_url'];
 			}
 		}
 
 		$get_headers = [ 'Accept' => 'application/json' ];
 		if ( $site_key ) {
 			$get_headers['X-Update-Key'] = $site_key;
+			$get_headers['X-Site-URL']   = $request_identity['site_url'];
 		}
 		if ( null !== $this->license_client ) {
 			$license_key = $this->license_client->decrypt_key();
 			if ( '' !== $license_key ) {
 				$get_headers['X-License-Key'] = $license_key;
-				$get_headers['X-Site-URL']    = $this->scope->site_url();
+				$get_headers['X-Site-URL']    = $request_identity['site_url'];
 			}
 		}
 
